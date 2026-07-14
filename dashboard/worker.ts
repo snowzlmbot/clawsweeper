@@ -867,6 +867,10 @@ export class ExactReviewQueue {
       });
       await this.scheduleNext(state, now);
       if (changed) await this.recordPressureHistory(state, now);
+      const pressureHistory = exactReviewQueuePressureHistory(
+        [...(await this.readPressureHistory(now)), exactReviewQueuePressurePoint(state, now)],
+        now,
+      );
       return json({
         ...exactReviewQueueStats(
           state,
@@ -876,7 +880,7 @@ export class ExactReviewQueue {
           exactReviewDispatchLeaseMs(this.env),
           exactReviewExecutionLeaseMs(this.env),
         ),
-        pressure_history: await this.readPressureHistory(now),
+        pressure_history: pressureHistory,
         delivery_receipts: this.deliveryReceiptCountSync(),
         storage_schema_version: EXACT_REVIEW_QUEUE_STORAGE_SCHEMA_VERSION,
         legacy_rollback_available:
