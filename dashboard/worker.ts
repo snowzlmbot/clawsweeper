@@ -2960,10 +2960,21 @@ function reclaimExpiredExactReviewLease(
     delete state.items[key];
     return true;
   }
+  const publication = exactReviewQueueIsPublication(item);
   clearExactReviewLease(item);
   item.state = "pending";
-  item.nextAttemptAt = now;
-  if (hasNewerRevision) item.attempts = 0;
+  if (hasNewerRevision) {
+    item.attempts = 0;
+    item.nextAttemptAt = exactReviewQueueEnqueueAttemptAt(state, now);
+  } else if (publication) {
+    item.attempts += 1;
+    item.nextAttemptAt = Math.max(
+      exactReviewQueueEnqueueAttemptAt(state, now),
+      now + exactReviewRetryDelayMs(item.attempts),
+    );
+  } else {
+    item.nextAttemptAt = exactReviewQueueEnqueueAttemptAt(state, now);
+  }
   item.updatedAt = now;
   return true;
 }

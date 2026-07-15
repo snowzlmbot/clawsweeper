@@ -155,8 +155,10 @@ workflows holding the expired lease cannot claim it.
 Run-attempt binding and a per-claim generation check keep delayed terminal
 decisions from releasing a later rerun; queued and in-progress runs are never
 released. If a workflow never claims or completes, the Durable Object reclaims
-the expired lease. This keeps capacity waiting and retry state out of GitHub
-Actions runners.
+the expired lease. Unclaimed exact-review publications use a 15-minute claim
+window and enter bounded retry backoff before re-admission, so repeatedly
+unclaimed older artifacts yield publication capacity to later results. This
+keeps capacity waiting and retry state out of GitHub Actions runners.
 
 Examples with the current config:
 
