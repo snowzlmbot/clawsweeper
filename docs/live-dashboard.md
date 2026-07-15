@@ -224,7 +224,9 @@ The same endpoint exposes `generated_at`, `ready_pending`,
 `admissible_pending`, `pressure`, `handoff_health`, and oldest timestamps and
 ages for the pending, dispatching, and leased phases. `ready_pending` excludes
 retry-delayed items. `admissible_pending` further excludes ready items blocked
-by their target's exact-review cap. `pressure` is a deterministic observation
+by their target's exact-review cap. `pressure` and its bounded history exclude
+artifact-publication rows because those rows use a separate publisher slot and
+do not consume review admission capacity. `pressure` is a deterministic observation
 from that same queue snapshot: it reports `congested` or `saturated` only when
 capacity is full, the dispatcher and handoff telemetry are known, and
 target-admissible backlog remains. The snapshot adds no GitHub API fanout, and

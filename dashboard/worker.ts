@@ -180,7 +180,10 @@ const EXACT_REVIEW_QUEUE_LEGACY_RECEIPT_SHIFT_MS = 2 * 24 * 60 * 60 * 1000;
 const EXACT_REVIEW_QUEUE_ROLLBACK_CLOCK_SKEW_MS = 5 * 60 * 1000;
 const EXACT_REVIEW_QUEUE_LEGACY_GENERATION_PREFIX = "__clawsweeper_sql_generation:";
 const EXACT_REVIEW_QUEUE_STATE_KEY = "exact-review-queue";
-const EXACT_REVIEW_QUEUE_PRESSURE_HISTORY_KEY = "exact-review-queue-pressure-history:v1";
+// v2 excludes artifact-publication rows so a restored Bay trend only represents
+// review-admission pressure. Keeping it separate avoids mixing prior semantics
+// into the three-hour chart during rollout.
+const EXACT_REVIEW_QUEUE_PRESSURE_HISTORY_KEY = "exact-review-queue-pressure-history:v2";
 const EXACT_REVIEW_QUEUE_PRESSURE_BUCKET_MS = 5 * 60_000;
 const EXACT_REVIEW_QUEUE_PRESSURE_WINDOW_MS = 3 * 60 * 60_000;
 const EXACT_REVIEW_QUEUE_PRESSURE_POINT_LIMIT =
@@ -2936,8 +2939,17 @@ function exactReviewQueueStats(
   executionLeaseMs = DEFAULT_EXACT_REVIEW_EXECUTION_LEASE_MS,
 ) {
   const items = Object.values(state.items);
+  const reviewItems = items.filter((item) => !exactReviewQueueIsPublication(item));
   const handoffHealth = summarizeExactReviewHandoff({
     items,
+    dispatcher: state.dispatcher,
+    now,
+    capacity,
+    dispatchLeaseMs,
+    executionLeaseMs,
+  });
+  const reviewHandoffHealth = summarizeExactReviewHandoff({
+    items: reviewItems,
     dispatcher: state.dispatcher,
     now,
     capacity,
@@ -2995,18 +3007,27 @@ function exactReviewQueueStats(
   const readyPending = items.filter(
     (item) => item.state === "pending" && item.nextAttemptAt <= now,
   ).length;
+  const readyReviewPending = reviewItems.filter(
+    (item) => item.state === "pending" && item.nextAttemptAt <= now,
+  ).length;
   const admissiblePending = exactReviewQueueAdmittedItems(
     state,
     now,
     Number.MAX_SAFE_INTEGER,
     targetCapacity,
   ).length;
+  const admissibleReviewPending = exactReviewQueueAdmittedItems(
+    state,
+    now,
+    Number.MAX_SAFE_INTEGER,
+    targetCapacity,
+  ).filter((item) => !exactReviewQueueIsPublication(item)).length;
   const pressure = summarizeExactReviewPressure({
-    pending: handoffHealth.phases.pending.count,
-    readyPending,
-    admissiblePending,
-    dispatching: handoffHealth.phases.dispatching.count,
-    leased: handoffHealth.phases.leased.count,
+    pending: reviewHandoffHealth.phases.pending.count,
+    readyPending: readyReviewPending,
+    admissiblePending: admissibleReviewPending,
+    dispatching: reviewHandoffHealth.phases.dispatching.count,
+    leased: reviewHandoffHealth.phases.leased.count,
     capacity,
     dispatcherState: state.dispatcher?.state,
     handoffStatus: handoffHealth.status,
@@ -3048,6 +3069,7 @@ function exactReviewQueuePressurePoint(state: ExactReviewQueueState, observedAt:
   let dispatching = 0;
   let leased = 0;
   for (const item of Object.values(state.items)) {
+    if (exactReviewQueueIsPublication(item)) continue;
     if (item.state === "pending") pending += 1;
     else if (item.state === "dispatching") dispatching += 1;
     else if (item.state === "leased") leased += 1;

@@ -129,9 +129,10 @@ const denseTerminalBuffer = Array.from({ length: 20 }, (_, index) =>
   }),
 );
 const proofQueuePressure = {
-  pending: 405,
+  pending: 406,
   dispatching: 6,
   leased: 58,
+  pressure: { pending: 405 },
   pressure_history: [
     { observed_at: "2026-07-11T15:05:00.000Z", pending: 318, dispatching: 12, leased: 45 },
     { observed_at: "2026-07-11T16:00:00.000Z", pending: 342, dispatching: 9, leased: 51 },

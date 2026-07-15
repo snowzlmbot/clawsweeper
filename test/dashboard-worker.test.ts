@@ -107,7 +107,7 @@ test("exact-review queue keeps its core mutation available when pressure history
       buildExactReviewQueueRequest("pressure-write-success", 605, "opened"),
     );
     assert.equal(firstResponse.status, 202);
-    storage.failNextPut("exact-review-queue-pressure-history:v1");
+    storage.failNextPut("exact-review-queue-pressure-history:v2");
     const secondResponse = await queue.fetch(
       buildExactReviewQueueRequest("pressure-write-failure", 606, "opened"),
     );
@@ -204,6 +204,52 @@ test("dashboard status reports saturated exact-review pressure at full capacity"
     pending: 1,
     ready_pending: 1,
     admissible_pending: 1,
+  });
+});
+
+test("dashboard pressure excludes artifact publishers from review capacity", async () => {
+  const storage = new MemoryDurableStorage();
+  const queue = new ExactReviewQueue(
+    { storage },
+    {
+      EXACT_REVIEW_QUEUE_MAX_CONCURRENT: "1",
+      EXACT_REVIEW_TARGET_MAX_CONCURRENT: "1",
+    },
+  );
+  await queue.fetch(
+    buildExactReviewQueueRequest("pressure-publisher", 603, "opened", "issue", "openclaw/gogcli"),
+  );
+  const state = (await storage.get("exact-review-queue")) as {
+    dispatcher?: { state: "active"; checkedAt: number; workflowState: string };
+    items: Record<string, ReturnType<typeof leasedExactReviewQueueItem>>;
+  };
+  state.dispatcher = { state: "active", checkedAt: Date.now(), workflowState: "active" };
+  const publisher = leasedExactReviewQueueItem(604, "publish-604");
+  publisher.decision = { ...publisher.decision, sourceAction: "exact_review_artifact_publish" };
+  state.items[publisher.key] = publisher;
+  await storage.put("exact-review-queue", state);
+
+  const status = await exactReviewQueueStatusSnapshot({
+    EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
+  });
+
+  assert.ok(status);
+  assert.equal(status.pending, 1);
+  assert.equal(status.leased, 1);
+  assert.deepEqual(status.pressure, {
+    status: "idle",
+    reason: "capacity_available",
+    capacity: 1,
+    active: 0,
+    pending: 1,
+    ready_pending: 1,
+    admissible_pending: 1,
+  });
+  assert.deepEqual(status.pressure_history.at(-1), {
+    observed_at: status.pressure_history.at(-1)?.observed_at,
+    pending: 1,
+    dispatching: 0,
+    leased: 0,
   });
 });
 
