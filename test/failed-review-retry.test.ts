@@ -14,6 +14,9 @@ import {
 } from "../dist/clawsweeper.js";
 import { tmpPrefix, withMockGh, workPlanCandidateReport } from "./helpers.ts";
 
+// Proof branches run from a fork, while this suite's gh stub models the canonical repository.
+process.env.GITHUB_REPOSITORY = "openclaw/clawsweeper";
+
 function failedReviewReport(overrides = {}) {
   return `${workPlanCandidateReport({
     repository: "openclaw/openclaw",
