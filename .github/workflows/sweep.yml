@@ -313,7 +313,7 @@ jobs:
     timeout-minutes: 120
     concurrency:
       group: clawsweeper-event-review-${{ github.event.client_payload.queue_claim.item_key || github.event.client_payload.item_key || github.run_id }}
-      cancel-in-progress: false
+      cancel-in-progress: true
     permissions:
       actions: write
       checks: read
