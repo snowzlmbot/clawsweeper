@@ -32,11 +32,23 @@ shard posts a short status placeholder with the same durable identity marker.
 The placeholder is intentionally light and crustacean-friendly, then the final
 review sync edits that exact comment in place.
 
+When a newer source revision acquires its lease, ClawSweeper deletes dedicated
+review-start placeholders for older revisions immediately. It never deletes a
+same-revision lease during this step; same-revision contenders still use the
+server-assigned comment-id election, and expired leftovers retain the existing
+conservative cleanup path.
+
 For a PR that needs work, the visible comment starts with:
 
 ```text
 Codex review: needs changes before merge.
 ```
+
+The visible `Summary` also includes `Reviewed head: <full-sha>`. This makes the
+human-facing verdict self-identifying without requiring maintainers to inspect
+hidden markers. Publication still verifies the durable tuple against live state;
+the visible SHA is evidence of the captured review revision, not a substitute
+for that guard.
 
 For an external PR that lacks after-fix real behavior proof, the visible comment
 starts with:

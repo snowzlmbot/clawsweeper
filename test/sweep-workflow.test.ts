@@ -2538,7 +2538,7 @@ test("sweep event reviews and target fanout avoid storm amplification", () => {
   assert.match(eventBlock, /lease_revision: leaseRevision/);
   assert.match(eventBlock, /claim_generation: claimGeneration/);
   assert.match(eventBlock, /decision=\$\{JSON\.stringify\(decision\)\}/);
-  assert.match(eventBlock, /cancel-in-progress: false/);
+  assert.match(eventBlock, /cancel-in-progress: true/);
   assert.match(legacyIntakeBlock, /legacy-event-queue-intake:/);
   assert.match(legacyIntakeBlock, /\/internal\/exact-review\/enqueue/);
   assert.match(legacyIntakeBlock, /gh api "repos\/\$target_repo" --jq \.default_branch/);

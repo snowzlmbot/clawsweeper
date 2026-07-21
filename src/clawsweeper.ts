@@ -127,6 +127,7 @@ import {
 import {
   expiredReviewStartStatusLeases,
   freshExactHeadReviewStartLease,
+  supersededReviewStartStatusLeases,
 } from "./repair/comment-router-core.js";
 import {
   AUTOMERGE_LABEL,
@@ -18539,10 +18540,12 @@ function publicPrSummaryBody(
   summaryLine: string,
   reproductionAssessment: string,
   prSurfaceSummary: string,
+  reviewedHeadSha: string,
 ): string {
   return [
     summaryLine,
     prSurfaceSummary ? `PR surface: ${prSurfaceSummary}` : "",
+    reviewedHeadSha ? `Reviewed head: \`${reviewedHeadSha}\`` : "",
     publicReproducibilityLine(reproductionAssessment),
   ]
     .filter(Boolean)
@@ -18816,7 +18819,12 @@ function renderKeepOpenCommentFromReport(
     appendPublicSection(
       lines,
       "Summary",
-      publicPrSummaryBody(changeSummaryLine, reproductionAssessment, prSurfaceSummary),
+      publicPrSummaryBody(
+        changeSummaryLine,
+        reproductionAssessment,
+        prSurfaceSummary,
+        pullHeadShaFromReport(markdown) ?? "",
+      ),
     );
     lines.push(renderReviewMetricsDigest(reviewMetrics), "");
     const dataModelWarning = renderDataModelWarningFromReport(markdown);
@@ -20691,6 +20699,11 @@ function postReviewStartStatusComment(options: {
   if (initialLease) {
     return heldReviewStartStatusCommentResult(initialLease.expiresAt, false);
   }
+  reapSupersededDedicatedReviewStartLeases(
+    options.item.number,
+    initialState.dedicatedLeaseComments,
+    normalizedHead,
+  );
   reapExpiredDedicatedReviewStartLeases(
     options.item.number,
     initialState.dedicatedLeaseComments,
@@ -20823,6 +20836,44 @@ function reapExpiredDedicatedReviewStartLeases(
       // A failed reap must never block acquiring the new lease.
       console.error(
         `[review] could not reap expired review lease comment ${lease.commentId} for #${itemNumber}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+}
+
+function reapSupersededDedicatedReviewStartLeases(
+  itemNumber: number,
+  dedicatedLeaseComments: Record<string, unknown>[],
+  currentHeadSha: string,
+): void {
+  const superseded = supersededReviewStartStatusLeases({
+    comments: dedicatedLeaseComments,
+    itemNumber,
+    headSha: currentHeadSha,
+    trustedAuthors: new Set(
+      [...PATCHABLE_REVIEW_COMMENT_AUTHORS].map((author) => author.toLowerCase()),
+    ),
+  });
+  for (const lease of superseded) {
+    try {
+      ghObservedMutationCommand({
+        identity: `review_lease_supersede:${itemNumber}:${lease.commentId}`,
+        args: [
+          "api",
+          `repos/${targetRepo()}/issues/comments/${lease.commentId}`,
+          "--method",
+          "DELETE",
+        ],
+      });
+      console.error(
+        `[review] deleted superseded review lease comment ${lease.commentId} for #${itemNumber} (reviewed head ${lease.headSha}, current head ${currentHeadSha})`,
+      );
+    } catch (error) {
+      // A failed cleanup must never block the current revision from acquiring its lease.
+      console.error(
+        `[review] could not delete superseded review lease comment ${lease.commentId} for #${itemNumber}: ${
           error instanceof Error ? error.message : String(error)
         }`,
       );

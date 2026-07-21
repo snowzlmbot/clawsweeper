@@ -285,7 +285,7 @@ const DEFAULT_EXACT_REVIEW_EXECUTION_LEASE_MS = 130 * 60 * 1000;
 const DEFAULT_EXACT_REVIEW_HEARTBEAT_GRACE_MS = 20 * 60 * 1000;
 const DEFAULT_EXACT_REVIEW_RETRY_MS = 30_000;
 const DEFAULT_EXACT_REVIEW_WORKFLOW_PAUSED_RETRY_MS = 60_000;
-const DEFAULT_EXACT_REVIEW_DISPATCH_DEBOUNCE_MS = 45_000;
+const DEFAULT_EXACT_REVIEW_DISPATCH_DEBOUNCE_MS = 90_000;
 const DEFAULT_EXACT_REVIEW_DISPATCH_DEBOUNCE_MAX_MS = 3 * 60_000;
 const DEFAULT_EXACT_REVIEW_PENDING_SOFT_LIMIT = 300;
 const EXACT_REVIEW_COMPLETION_RETRY_MAX_MS = 2 * 60 * 60 * 1000;
@@ -818,6 +818,7 @@ export class ExactReviewQueue {
         }
         const key = exactReviewItemKey(decision);
         const current = state.items[key];
+        let supersededRunId: string | null = null;
         if (current) {
           const ignoredRecovery =
             decision.sourceAction === FAILED_REVIEW_SHARD_RECOVERY_SOURCE_ACTION;
@@ -827,10 +828,23 @@ export class ExactReviewQueue {
           // Ordinary source events retain normal replacement behavior, including the
           // command-context merge for pending items.
           if (!ignoredRecovery) {
+            const supersedesActiveReview =
+              decision.supersedesInProgress &&
+              !exactReviewQueueIsPublication(current) &&
+              (current.state === "dispatching" || current.state === "leased");
+            if (supersedesActiveReview) {
+              supersededRunId = current.claimedRunId || null;
+              clearExactReviewLease(current);
+              current.state = "pending";
+              current.createdAt = now;
+              current.parkedReason = undefined;
+            }
             const mergeable = current.state === "pending" || current.state === "parked";
-            current.decision = mergeable
-              ? mergePendingExactReviewDecision(current.decision, decision)
-              : decision;
+            current.decision = supersedesActiveReview
+              ? decision
+              : mergeable
+                ? mergePendingExactReviewDecision(current.decision, decision)
+                : decision;
             current.revision += 1;
             current.updatedAt = now;
             // Immediacy must come from the merged decision: a pending explicit command
@@ -883,7 +897,13 @@ export class ExactReviewQueue {
             publicationSuperseded: supersededPublications,
           });
         }
-        return { deduped: false as const, key, state, supersededPublications };
+        return {
+          deduped: false as const,
+          key,
+          state,
+          supersededPublications,
+          supersededRunId,
+        };
       });
       if (accepted.deduped) {
         if ("state" in accepted) await this.scheduleNext(accepted.state, now);
@@ -914,6 +934,9 @@ export class ExactReviewQueue {
       }
       if (accepted.shed) {
         return json({ ok: true, shed: true, reason: "backpressure" }, 202);
+      }
+      if (accepted.supersededRunId) {
+        await cancelSupersededExactReviewRun(this.env, accepted.supersededRunId);
       }
       await this.scheduleNext(accepted.state, now);
       return json(
@@ -7377,6 +7400,30 @@ export async function exactReviewActionsReadToken(env) {
   return exactReviewRepositoryToken(env, { actions: "read" });
 }
 
+async function exactReviewActionsWriteToken(env) {
+  return exactReviewRepositoryToken(env, { actions: "write" });
+}
+
+async function cancelSupersededExactReviewRun(env, runId: string) {
+  try {
+    const token = await exactReviewActionsWriteToken(env);
+    await githubTokenJson({
+      token,
+      path: `/repos/${CLAWSWEEPER_REVIEW_REPO}/actions/runs/${runId}/cancel`,
+      method: "POST",
+      body: undefined,
+      errorLabel: "Superseded ClawSweeper run cancellation",
+    });
+  } catch (error) {
+    // The queue revision and workflow concurrency remain authoritative when the
+    // best-effort API cancellation races a terminal run or GitHub is unavailable.
+    console.warn(
+      `superseded exact-review run ${runId} could not be cancelled`,
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+}
+
 async function exactReviewRepositoryToken(env, permissions) {
   const credentials = githubAppCredentials(env);
   if (!credentials) throw new Error("github app is not configured");
@@ -7623,7 +7670,8 @@ async function githubTokenJson({ token, path, method = "GET", body, errorLabel }
     );
   }
   if (response.status === 204) return {};
-  return response.json();
+  const text = await response.text();
+  return text ? JSON.parse(text) : {};
 }
 
 function exactReviewPublicationBatchId(value) {
