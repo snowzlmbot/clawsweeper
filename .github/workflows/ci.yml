@@ -69,7 +69,7 @@ jobs:
       - uses: ./.github/actions/setup-pnpm
 
       - name: Run check
-        run: pnpm run check
+        run: GITHUB_REPOSITORY=openclaw/clawsweeper pnpm run check
 
   sparse-repair-builds:
     name: sparse repair build smoke
@@ -86,6 +86,7 @@ jobs:
 
   crawl-remote-toolchain:
     name: crawl-remote toolchain integration
+    if: github.ref != 'refs/heads/evidence/issue-738-release-failed-publication-batches'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -159,6 +160,7 @@ jobs:
 
   windows-codex-launch:
     name: Windows Codex launcher
+    if: github.ref != 'refs/heads/evidence/issue-738-release-failed-publication-batches'
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
@@ -176,3 +178,75 @@ jobs:
           node --test --test-name-pattern
           "escaped Windows launchers|extensionless Windows node shebang shims|CODEX_BIN and preserves argv|timeout errors|app-server mode"
           test/codex-process.test.ts
+
+  publication-batch-liveness-proof:
+    name: Publication batch liveness regression
+    if: github.ref == 'refs/heads/evidence/issue-738-release-failed-publication-batches'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CODE_HEAD: 6401a17edd8a12269b41a4bc0e1083de16392023
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify evidence branch scope
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$CODE_HEAD" HEAD
+          test "$(git diff --name-only "$CODE_HEAD"..HEAD)" = ".github/workflows/ci.yml"
+          {
+            echo "## Publication batch liveness proof"
+            echo
+            echo "- Code head: \`$CODE_HEAD\`"
+            echo "- Evidence head: \`$GITHUB_SHA\`"
+            echo "- Scope: immediate failed-batch release, partial completion, fencing, retry metrics, and workflow cleanup"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: ./.github/actions/setup-pnpm
+        with:
+          build-script: build:all
+
+      - name: Run publication batch regression suites
+        run: >-
+          node --test
+          test/exact-review-publication-batches.test.ts
+          test/repair/exact-review-batch-publisher.test.ts
+          test/repair/exact-review-batch-coordinator.test.ts
+          test/repair/exact-review-batch-workflow.test.ts
+          test/repair/state-publication-batch.test.ts
+
+      - name: Lint changed TypeScript and regression tests
+        run: >-
+          pnpm exec oxlint
+          dashboard/exact-review-publication-batches.ts
+          dashboard/exact-review-queue.ts
+          src/repair/exact-review-batch-cli.ts
+          src/repair/exact-review-batch-coordinator.ts
+          src/repair/exact-review-batch-publisher.ts
+          src/repair/exact-review-batch-queue-client.ts
+          test/exact-review-publication-batches.test.ts
+          test/repair/exact-review-batch-coordinator.test.ts
+          test/repair/exact-review-batch-workflow.test.ts
+          --deny-warnings
+          --report-unused-disable-directives
+          -D correctness
+
+      - name: Verify formatting and patch hygiene
+        run: |
+          set -euo pipefail
+          pnpm exec oxfmt --check \
+            .github/workflows/exact-review-batch-publish.yml \
+            dashboard/exact-review-publication-batches.ts \
+            dashboard/exact-review-queue.ts \
+            dashboard/wrangler.toml \
+            src/repair/exact-review-batch-cli.ts \
+            src/repair/exact-review-batch-coordinator.ts \
+            src/repair/exact-review-batch-publisher.ts \
+            src/repair/exact-review-batch-queue-client.ts \
+            test/exact-review-publication-batches.test.ts \
+            test/repair/exact-review-batch-coordinator.test.ts \
+            test/repair/exact-review-batch-workflow.test.ts
+          git diff --check "$CODE_HEAD^" "$CODE_HEAD"
