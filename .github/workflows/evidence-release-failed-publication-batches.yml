@@ -1,0 +1,82 @@
+name: Evidence - release failed publication batches
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  focused-proof:
+    name: build, focused tests, lint, and format
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+
+      - name: Verify evidence topology
+        env:
+          CODE_HEAD: 94d3ef355f07d648bf67df175d3260e89fa5008b
+          PROOF_WORKFLOW: .github/workflows/evidence-release-failed-publication-batches.yml
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "$CODE_HEAD"
+          mapfile -t changed < <(git diff --name-only "$CODE_HEAD" HEAD)
+          test "${#changed[@]}" -eq 1
+          test "${changed[0]}" = "$PROOF_WORKFLOW"
+
+      - uses: ./.github/actions/setup-pnpm
+
+      - name: Build all TypeScript surfaces
+        run: pnpm run build:all
+
+      - name: Run changed-path regression suites
+        run: |
+          node --test \
+            test/exact-review-publication-batches.test.ts \
+            test/repair/exact-review-batch-coordinator.test.ts \
+            test/repair/exact-review-batch-workflow.test.ts
+
+      - name: Lint changed TypeScript paths
+        run: |
+          pnpm exec oxlint \
+            dashboard/exact-review-publication-batches.ts \
+            dashboard/exact-review-queue.ts \
+            --tsconfig tsconfig.dashboard.json \
+            --deny-warnings \
+            --report-unused-disable-directives \
+            -D correctness
+          pnpm exec oxlint \
+            src/repair/exact-review-batch-cli.ts \
+            src/repair/exact-review-batch-coordinator.ts \
+            src/repair/exact-review-batch-publisher.ts \
+            src/repair/exact-review-batch-queue-client.ts \
+            --tsconfig tsconfig.repair.json \
+            --deny-warnings \
+            --report-unused-disable-directives \
+            -D correctness
+          pnpm exec oxlint \
+            test/exact-review-publication-batches.test.ts \
+            test/repair/exact-review-batch-coordinator.test.ts \
+            test/repair/exact-review-batch-workflow.test.ts \
+            --deny-warnings \
+            --report-unused-disable-directives \
+            -D correctness
+
+      - name: Check changed-path formatting
+        run: |
+          pnpm exec oxfmt --check \
+            .github/workflows/exact-review-batch-publish.yml \
+            .github/workflows/evidence-release-failed-publication-batches.yml \
+            dashboard/exact-review-publication-batches.ts \
+            dashboard/exact-review-queue.ts \
+            docs/state-publication-batching-plan.md \
+            src/repair/exact-review-batch-cli.ts \
+            src/repair/exact-review-batch-coordinator.ts \
+            src/repair/exact-review-batch-publisher.ts \
+            src/repair/exact-review-batch-queue-client.ts \
+            test/exact-review-publication-batches.test.ts \
+            test/repair/exact-review-batch-coordinator.test.ts \
+            test/repair/exact-review-batch-workflow.test.ts
