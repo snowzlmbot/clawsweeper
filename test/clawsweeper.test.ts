@@ -2204,7 +2204,7 @@ test("sweep workflow executes only durable queue leases without runner-side admi
   assert.match(legacyIntakeBlock, /commandStatusMarker: payload\.command_status_marker/);
   assert.match(legacyIntakeBlock, /statusCommentId: payload\.status_comment_id/);
   assert.match(legacyIntakeBlock, /additionalPrompt: payload\.additional_prompt/);
-  assert.match(eventReviewBlock, /cancel-in-progress: false/);
+  assert.match(eventReviewBlock, /cancel-in-progress: true/);
   assert.match(exactReviewStep, /GH_TOKEN: \$\{\{ steps\.target-read-token\.outputs\.token \}\}/);
   assert.match(exactReviewStep, /--readonly-openclaw/);
   assert.match(exactReviewStep, /--skip-start-comment/);
