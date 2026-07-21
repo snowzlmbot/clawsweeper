@@ -1,0 +1,59 @@
+name: State publish fairness proof
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fairness-proof:
+    name: Bounded priority-yield regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CODE_HEAD: 6c076f3b0069b3d1cf24c16f945ba8245b0c547b
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify evidence branch scope
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$CODE_HEAD" HEAD
+          test "$(git diff --name-only "$CODE_HEAD"..HEAD)" = ".github/workflows/state-publish-fairness-proof.yml"
+          {
+            echo "## State publish fairness proof"
+            echo
+            echo "- Code head: \`$CODE_HEAD\`"
+            echo "- Evidence head: \`$GITHUB_SHA\`"
+            echo "- Scope: bounded priority-yield regression, focused lint, and formatting"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: ./.github/actions/setup-pnpm
+        with:
+          build-script: build:repair
+
+      - name: Run priority-yield regression tests
+        run: >-
+          node --test
+          --test-name-pattern
+          "ordinary state publisher (yields|ages).*priority intent"
+          test/repair/git-publish.test.ts
+
+      - name: Lint changed TypeScript and regression tests
+        run: >-
+          pnpm exec oxlint
+          src/repair/git-publish.ts
+          test/repair/git-publish.test.ts
+          --deny-warnings
+          --report-unused-disable-directives
+          -D correctness
+
+      - name: Verify formatting and patch hygiene
+        run: |
+          set -euo pipefail
+          pnpm exec oxfmt --check src/repair/git-publish.ts test/repair/git-publish.test.ts
+          git diff --check "$CODE_HEAD^" "$CODE_HEAD"
