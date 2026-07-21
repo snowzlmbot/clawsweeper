@@ -25,7 +25,7 @@ jobs:
           PROOF_WORKFLOW: .github/workflows/evidence-release-failed-publication-batches.yml
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "$CODE_HEAD"
+          git merge-base --is-ancestor "$CODE_HEAD" HEAD
           mapfile -t changed < <(git diff --name-only "$CODE_HEAD" HEAD)
           test "${#changed[@]}" -eq 1
           test "${changed[0]}" = "$PROOF_WORKFLOW"
