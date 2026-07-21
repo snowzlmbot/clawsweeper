@@ -90,6 +90,34 @@ minutes, and `state_writer.mode=unknown`. A matching-ref query at `13:43:23Z`
 returned no lease refs, and the lease ref is also empty after the later failure;
 absence of a stale ref does not repair unfair handoff among live writers.
 
+### Batch failure terminalization
+
+Repository-wide writer serialization addresses fair access to the generated
+state branch, but a batch must also relinquish its own queue ownership whenever
+publication cannot finish. A failed or partially successful workflow must not
+leave unfinished members behind until the 30-minute lease expiry, because one
+active batch blocks every later batch departure.
+
+Every claimed member therefore reaches one fenced acknowledgement before the
+workflow exits:
+
+- `published` or `superseded` removes the matching queue revision; or
+- `retryable_failure`, `refresh_required`, or `permanent_failure` terminalizes
+  only the matching batch membership and routes the underlying publication item
+  through the existing backoff, refresh, and dead-letter policy.
+
+Explicit failure release uses the existing `lease_expired` membership value so
+the additive SQLite schema remains migration-free. Revision and
+claim-generation fencing still prevent an old worker from releasing newer
+ownership. An `always()` workflow cleanup acknowledges any member left
+unfinished by cancellation or an unexpected step failure, while lease expiry
+remains the final crash fallback rather than the normal recovery path.
+
+This contract is independent of the coordinator rollout: the coordinator from
+#738/#756 makes state-writer admission durable and fair, while batch failure
+terminalization keeps the exact-review publication queue live when the admitted
+writer, artifact processing, or GitHub effects fail.
+
 ### Writer audit
 
 The production evidence and call-site/workflow audit identify these generated

@@ -42,7 +42,7 @@ export type PublicationBatch = {
 
 export type PublicationBatchCompletion = PublicationBatchCandidate & {
   claimGeneration: number;
-  terminalOutcome: Exclude<PublicationBatchTerminalOutcome, "lease_expired">;
+  terminalOutcome: PublicationBatchTerminalOutcome;
 };
 
 export type PublicationBatchFence = PublicationBatchCandidate & {
