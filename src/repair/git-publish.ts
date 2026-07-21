@@ -108,6 +108,11 @@ const STATE_PUBLISH_LEASE_WAIT_MS = 1_000;
 const STATE_PUBLISH_LEASE_MAX_WAIT_MS = 5_000;
 const STATE_PUBLISH_PRIORITY_INTENT_ATTEMPT = 2;
 const STATE_PUBLISH_PRIORITY_INTENT_MAX_TTL_MS = 5 * 60_000;
+// Priority intent is a bounded head start, not an unbounded exclusion. Without
+// aging, a continuous stream of priority writers can make an ordinary publisher
+// yield for its entire acquisition window even while the lease repeatedly turns
+// over. The exact-review batch publisher then cannot drain already-reviewed work.
+const STATE_PUBLISH_PRIORITY_YIELD_BUDGET_MS = 2 * 60_000;
 const STATE_PUBLISH_OWNER_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SKIP_CI_DIRECTIVE_PATTERN =
@@ -154,6 +159,7 @@ export type StatePublishLeaseOptions = {
   acquireTimeoutMs?: number;
   ttlMs?: number;
   waitMs?: number;
+  priorityYieldBudgetMs?: number;
   observer?: StateWriterTelemetryRecorder;
 };
 
@@ -1633,11 +1639,19 @@ function acquireStatePublishLease(
     STATE_PUBLISH_LEASE_ACQUIRE_TIMEOUT_MS,
   );
   const waitMs = positiveInt(options.waitMs, STATE_PUBLISH_LEASE_WAIT_MS);
-  const deadlineAtMs = Date.now() + acquireTimeoutMs;
+  const startedAtMs = Date.now();
+  const deadlineAtMs = startedAtMs + acquireTimeoutMs;
+  const priorityYieldBudgetMs = Math.min(
+    positiveInt(options.priorityYieldBudgetMs, STATE_PUBLISH_PRIORITY_YIELD_BUDGET_MS),
+    acquireTimeoutMs,
+  );
+  const priorityYieldDeadlineAtMs = startedAtMs + priorityYieldBudgetMs;
   const observedByOid = new Map<string, ObservedStatePublishLease>();
   const observedPriorityByOid = new Map<string, ObservedStatePublishLease>();
   let priorityIntent: StatePublishPriorityIntent | null = null;
   let attempt = 0;
+  let yieldedToPriorityIntent = false;
+  let priorityYieldBudgetLogged = false;
   activeStateWriterTelemetry?.enteredWaiting();
 
   // Spread a newly admitted publisher cohort before any of them attempts the
@@ -1654,13 +1668,26 @@ function acquireStatePublishLease(
       if (!observed || observed.expiresAtMs <= now) {
         const shouldYield =
           !priority &&
+          now < priorityYieldDeadlineAtMs &&
           shouldYieldToStatePublishPriorityIntent(
             remote,
             priorityIntentRef,
             owner,
             observedPriorityByOid,
           );
+        if (shouldYield) yieldedToPriorityIntent = true;
         if (!shouldYield) {
+          if (
+            !priority &&
+            yieldedToPriorityIntent &&
+            !priorityYieldBudgetLogged &&
+            now >= priorityYieldDeadlineAtMs
+          ) {
+            priorityYieldBudgetLogged = true;
+            console.log(
+              `State publish priority yield budget exhausted after ${priorityYieldBudgetMs}ms; entering fair contention`,
+            );
+          }
           const expiresAtMs = now + ttlMs;
           const oid = createStatePublishLeaseCommit({ branch, owner, ttlMs });
           const expectedOid = observed?.oid ?? "";

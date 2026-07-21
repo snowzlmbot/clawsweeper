@@ -2122,6 +2122,62 @@ test("ordinary state publisher yields to a live priority intent until it expires
   );
 });
 
+test("ordinary state publisher ages into fair contention before a live priority intent expires", () => {
+  const { origin, root, work } = createStateLeaseTestRepo("clawsweeper-priority-aging-");
+  const priorityRef = "refs/heads/clawsweeper-publish-priority/state";
+  const priorityOwner = randomUUID();
+  pushStateLeaseMetadata(work, priorityRef, {
+    owner: priorityOwner,
+    expiresAtMs: Date.now() + 10_000,
+    subject: "ClawSweeper state publish priority intent",
+  });
+
+  let operated = false;
+  const lines = captureConsoleLog(() => {
+    withEnv(
+      {
+        CLAWSWEEPER_PUBLISH_ROOT: work,
+        CLAWSWEEPER_PUBLISH_BRANCH: "state",
+      },
+      () =>
+        withStatePublishLease(
+          () => {
+            operated = true;
+          },
+          {
+            branch: "state",
+            acquireTimeoutMs: 5_000,
+            ttlMs: 30_000,
+            waitMs: 10,
+            priorityYieldBudgetMs: 500,
+          },
+        ),
+    );
+  });
+
+  assert.equal(operated, true);
+  assert.equal(
+    lines.some((line) =>
+      line.includes(`State publish lease yielding to priority intent owner=${priorityOwner}`),
+    ),
+    true,
+    lines.join("\n"),
+  );
+  assert.equal(
+    lines.some((line) =>
+      line.includes(
+        "State publish priority yield budget exhausted after 500ms; entering fair contention",
+      ),
+    ),
+    true,
+    lines.join("\n"),
+  );
+  assert.equal(
+    run("git", ["--git-dir", origin, "for-each-ref", "--format=%(refname)", priorityRef], root),
+    priorityRef,
+  );
+});
+
 test(
   "priority state publisher claims the next free lease slot ahead of an ordinary contender",
   { timeout: 90_000 },

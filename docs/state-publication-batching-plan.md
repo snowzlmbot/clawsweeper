@@ -544,6 +544,16 @@ active batch writers: 1
 - Select oldest eligible work first. Backoff items become eligible only at
   `next_attempt_at`.
 
+The single batch publisher remains an ordinary state-lease contender during
+the incremental rollout. A priority intent gives apply work a bounded head
+start, but an ordinary publisher must stop yielding after two minutes and enter
+normal lease contention. Priority still wins an immediately available slot at
+the start of that window; the bound prevents a continuous sequence of priority
+intents from excluding result publication for the full eight-minute acquisition
+timeout. This is an interim fairness guard while #738 moves state writes to one
+Durable Object-coordinated materializer; it is not a substitute for that
+single-writer architecture.
+
 Keep the first version static. Do not add another adaptive controller until the
 fixed policy has stable production measurements.
 
