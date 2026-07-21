@@ -3014,79 +3014,32 @@ test("exact-review queue coalesces deliveries, dispatches a bound rollout snapsh
         }),
       }),
     );
-    assert.equal(claimed.status, 200);
-    assert.deepEqual(await claimed.json(), {
-      ok: true,
-      claimed: true,
-      protocol_version: 2,
-      item_key: "openclaw/gogcli#597",
-      lease_revision: 2,
-      claim_generation: 1,
-      decision: {
-        targetRepo: "openclaw/gogcli",
-        targetBranch: "main",
-        itemNumber: 597,
-        itemKind: "issue",
-        sourceEvent: "issues",
-        sourceAction: "edited",
-        supersedesInProgress: true,
-        commandStatusMarker,
-        statusCommentId: 9001,
-        additionalPrompt: "Check the maintainer-requested regression path.",
-        codexTimeoutMs: 1_200_000,
-        mediaProofTimeoutMs: 480_000,
-      },
-    });
+    assert.equal(claimed.status, 409);
+    assert.deepEqual(await claimed.json(), { error: "lease_not_active" });
     stats = await (
       await queue.fetch(new Request("https://clawsweeper-exact-review-queue/stats"))
     ).json();
     assert.equal(stats.dispatching, 0);
-    assert.equal(stats.leased, 1);
-    assert.equal(stats.handoff_health.phases.leased.count, 1);
-    assert.equal(typeof stats.oldest_leased_age_seconds, "number");
-    assert.equal(
-      (
-        await queue.fetch(
-          new Request("https://clawsweeper-exact-review-queue/claim", {
-            method: "POST",
-            body: JSON.stringify({
-              lease_id: leaseId,
-              item_key: "openclaw/gogcli#597",
-              lease_revision: 2,
-              run_id: "101",
-              run_attempt: 1,
-            }),
-          }),
-        )
-      ).status,
-      409,
-    );
-
-    const completed = await queue.fetch(
-      new Request("https://clawsweeper-exact-review-queue/complete", {
-        method: "POST",
-        body: JSON.stringify({
-          lease_id: leaseId,
-          item_key: "openclaw/gogcli#597",
-          lease_revision: 2,
-          claim_generation: 1,
-          run_id: "100",
-          run_attempt: 1,
-        }),
-      }),
-    );
-    assert.deepEqual(await completed.json(), { ok: true, requeued: true });
+    assert.equal(stats.leased, 0);
     const requeued = (await storage.get("exact-review-queue")) as {
       items: Record<
         string,
-        { attempts: number; nextAttemptAt: number; decision: Record<string, unknown> }
+        {
+          state: string;
+          revision: number;
+          attempts: number;
+          nextAttemptAt: number;
+          decision: Record<string, unknown>;
+        }
       >;
     };
+    assert.equal(requeued.items["openclaw/gogcli#597"].state, "pending");
+    assert.equal(requeued.items["openclaw/gogcli#597"].revision, 3);
     assert.equal(requeued.items["openclaw/gogcli#597"].decision.commandStatusMarker, undefined);
     assert.equal(requeued.items["openclaw/gogcli#597"].decision.statusCommentId, undefined);
     assert.equal(requeued.items["openclaw/gogcli#597"].decision.additionalPrompt, undefined);
     assert.equal(requeued.items["openclaw/gogcli#597"].attempts, 0);
-    assert.ok(requeued.items["openclaw/gogcli#597"].nextAttemptAt <= Date.now());
+    assert.ok(requeued.items["openclaw/gogcli#597"].nextAttemptAt >= Date.now());
     stats = await (
       await queue.fetch(new Request("https://clawsweeper-exact-review-queue/stats"))
     ).json();
@@ -3623,7 +3576,7 @@ test("exact-review imports an active rollback before expiring an old bridge", as
   assert.equal(storage.rawHas("exact-review-queue"), false);
 });
 
-test("exact-review claim preserves its immutable decision across a newer enqueue", async () => {
+test("a newer exact-review enqueue revokes a claimed immutable decision", async () => {
   const storage = new MemoryDurableStorage();
   const item = unclaimedExactReviewQueueItem(620);
   await storage.put("exact-review-queue", {
@@ -3631,15 +3584,6 @@ test("exact-review claim preserves its immutable decision across a newer enqueue
     items: { "openclaw/openclaw#620": item },
   });
   const queue = new ExactReviewQueue({ storage }, {});
-
-  const newer = buildExactReviewQueueRequest(
-    "newer-620",
-    620,
-    "edited",
-    "pull_request",
-    "openclaw/openclaw",
-  );
-  assert.equal((await queue.fetch(newer)).status, 202);
 
   const claim = await queue.fetch(
     new Request("https://clawsweeper-exact-review-queue/claim", {
@@ -3664,16 +3608,27 @@ test("exact-review claim preserves its immutable decision across a newer enqueue
     decision: item.leaseDecision,
   });
 
+  const newer = buildExactReviewQueueRequest(
+    "newer-620",
+    620,
+    "edited",
+    "pull_request",
+    "openclaw/openclaw",
+  );
+  assert.equal((await queue.fetch(newer)).status, 202);
+
   const claimedState = (await storage.get("exact-review-queue")) as {
     items: Record<
       string,
       {
         revision: number;
         decision: { sourceAction: string; itemKind: string };
-        leaseDecision: { sourceAction: string; itemKind: string };
+        state: string;
+        leaseDecision?: { sourceAction: string; itemKind: string };
       }
     >;
   };
+  assert.equal(claimedState.items["openclaw/openclaw#620"].state, "pending");
   assert.equal(claimedState.items["openclaw/openclaw#620"].revision, 2);
   assert.deepEqual(claimedState.items["openclaw/openclaw#620"].decision, {
     targetRepo: "openclaw/openclaw",
@@ -3684,7 +3639,7 @@ test("exact-review claim preserves its immutable decision across a newer enqueue
     sourceAction: "edited",
     supersedesInProgress: true,
   });
-  assert.deepEqual(claimedState.items["openclaw/openclaw#620"].leaseDecision, item.leaseDecision);
+  assert.equal(claimedState.items["openclaw/openclaw#620"].leaseDecision, undefined);
 
   const complete = await queue.fetch(
     new Request("https://clawsweeper-exact-review-queue/complete", {
@@ -3700,22 +3655,11 @@ test("exact-review claim preserves its immutable decision across a newer enqueue
       }),
     }),
   );
-  assert.equal(complete.status, 200);
-  assert.deepEqual(await complete.json(), { ok: true, requeued: true });
-
-  const requeued = (await storage.get("exact-review-queue")) as {
-    items: Record<string, Record<string, unknown>>;
-  };
-  assert.equal(requeued.items["openclaw/openclaw#620"].state, "pending");
-  assert.equal(requeued.items["openclaw/openclaw#620"].revision, 2);
-  assert.equal(
-    (requeued.items["openclaw/openclaw#620"].decision as { sourceAction: string }).sourceAction,
-    "edited",
-  );
-  assert.equal(requeued.items["openclaw/openclaw#620"].leaseDecision, undefined);
+  assert.equal(complete.status, 409);
+  assert.deepEqual(await complete.json(), { error: "lease_not_claimed" });
 });
 
-test("new exact-review queue serves legacy workflow claims during rolling deploys", async () => {
+test("a newer exact-review enqueue revokes a claimed legacy workflow lease", async () => {
   const storage = new MemoryDurableStorage();
   const item = unclaimedExactReviewQueueItem(624);
   await storage.put("exact-review-queue", {
@@ -3723,21 +3667,6 @@ test("new exact-review queue serves legacy workflow claims during rolling deploy
     items: { "openclaw/openclaw#624": item },
   });
   const queue = new ExactReviewQueue({ storage }, {});
-
-  assert.equal(
-    (
-      await queue.fetch(
-        buildExactReviewQueueRequest(
-          "newer-624",
-          624,
-          "edited",
-          "pull_request",
-          "openclaw/openclaw",
-        ),
-      )
-    ).status,
-    202,
-  );
 
   const legacyClaim = await queue.fetch(
     new Request("https://clawsweeper-exact-review-queue/claim", {
@@ -3761,6 +3690,21 @@ test("new exact-review queue serves legacy workflow claims during rolling deploy
     decision: item.leaseDecision,
   });
 
+  assert.equal(
+    (
+      await queue.fetch(
+        buildExactReviewQueueRequest(
+          "newer-624",
+          624,
+          "edited",
+          "pull_request",
+          "openclaw/openclaw",
+        ),
+      )
+    ).status,
+    202,
+  );
+
   const strictCompletion = await queue.fetch(
     new Request("https://clawsweeper-exact-review-queue/complete", {
       method: "POST",
@@ -3776,7 +3720,7 @@ test("new exact-review queue serves legacy workflow claims during rolling deploy
     }),
   );
   assert.equal(strictCompletion.status, 409);
-  assert.deepEqual(await strictCompletion.json(), { error: "lease_protocol_not_claimed" });
+  assert.deepEqual(await strictCompletion.json(), { error: "lease_not_claimed" });
 
   const legacyCompletion = await queue.fetch(
     new Request("https://clawsweeper-exact-review-queue/complete", {
@@ -3789,8 +3733,8 @@ test("new exact-review queue serves legacy workflow claims during rolling deploy
       }),
     }),
   );
-  assert.equal(legacyCompletion.status, 200);
-  assert.deepEqual(await legacyCompletion.json(), { ok: true, requeued: true });
+  assert.equal(legacyCompletion.status, 409);
+  assert.deepEqual(await legacyCompletion.json(), { error: "lease_not_claimed" });
   const requeued = (await storage.get("exact-review-queue")) as {
     items: Record<string, Record<string, unknown>>;
   };
