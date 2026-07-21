@@ -266,6 +266,116 @@ test("exact-review queue bypasses debounce for commands and publications", async
   }
 });
 
+test("superseding source revisions revoke the old lease and cancel its Actions run", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalNow = Date.now;
+  const now = 3_000_000;
+  Date.now = () => now;
+  const storage = new MemoryDurableStorage();
+  const staleBase = leasedExactReviewQueueItem(753, "7530");
+  const stale = {
+    ...staleBase,
+    createdAt: now - 10 * 60_000,
+    updatedAt: now - 10 * 60_000,
+    decision: {
+      ...staleBase.decision,
+      itemKind: "pull_request" as const,
+      sourceEvent: "pull_request" as const,
+    },
+    leaseDecision: {
+      ...staleBase.leaseDecision,
+      itemKind: "pull_request" as const,
+      sourceEvent: "pull_request" as const,
+      commandStatusMarker: "<!-- clawsweeper-command-status:753:re_review:old-head -->",
+    },
+  };
+  await storage.put("exact-review-queue", {
+    deliveries: {},
+    items: { "openclaw/openclaw#753": stale },
+  });
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const cancelled: string[] = [];
+  let requestedPermissions: Record<string, string> | null = null;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/repos/openclaw/clawsweeper/installation") {
+      return jsonResponse({ id: 999 });
+    }
+    if (url.pathname === "/app/installations/999/access_tokens") {
+      requestedPermissions = JSON.parse(String(init?.body)).permissions;
+      return jsonResponse({ token: "actions-write-token" });
+    }
+    if (url.pathname === "/repos/openclaw/clawsweeper/actions/runs/7530/cancel") {
+      cancelled.push(url.pathname);
+      return new Response(null, { status: 202 });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  try {
+    const queue = new ExactReviewQueue(
+      { storage },
+      {
+        CLAWSWEEPER_APP_CLIENT_ID: "Iv23test",
+        CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
+        EXACT_REVIEW_DISPATCH_DEBOUNCE_MS: "90000",
+        EXACT_REVIEW_DISPATCH_DEBOUNCE_MAX_MS: "180000",
+      },
+    );
+    const response = await queue.fetch(
+      buildExactReviewQueueRequest(
+        "superseding-head-753",
+        753,
+        "synchronize",
+        "pull_request",
+        "openclaw/openclaw",
+      ),
+    );
+
+    assert.equal(response.status, 202);
+    assert.deepEqual(cancelled, ["/repos/openclaw/clawsweeper/actions/runs/7530/cancel"]);
+    assert.deepEqual(requestedPermissions, { actions: "write" });
+    const state = (await storage.get("exact-review-queue")) as {
+      items: Record<string, Record<string, unknown>>;
+    };
+    const current = state.items["openclaw/openclaw#753"];
+    assert.ok(current);
+    assert.equal(current.state, "pending");
+    assert.equal(current.revision, 2);
+    assert.equal(current.createdAt, now);
+    assert.equal(current.nextAttemptAt, now + 90_000);
+    assert.equal(current.leaseId, undefined);
+    assert.equal(current.claimedRunId, undefined);
+    assert.equal(current.leaseDecision, undefined);
+    assert.equal((current.decision as Record<string, unknown>).sourceAction, "synchronize");
+    assert.equal((current.decision as Record<string, unknown>).commandStatusMarker, undefined);
+
+    const staleCompletion = await queue.fetch(
+      new Request("https://clawsweeper-exact-review-queue/complete", {
+        method: "POST",
+        body: JSON.stringify({
+          lease_id: "lease-753",
+          item_key: "openclaw/openclaw#753",
+          lease_revision: 1,
+          claim_generation: 1,
+          run_id: "7530",
+          run_attempt: 1,
+          outcome: "success",
+        }),
+      }),
+    );
+    assert.equal(staleCompletion.status, 409);
+    assert.deepEqual(await staleCompletion.json(), { error: "lease_not_claimed" });
+  } finally {
+    globalThis.fetch = originalFetch;
+    Date.now = originalNow;
+  }
+});
+
 test("exact-review queue sheds only new recovery work above the pending soft limit", async () => {
   const storage = new MemoryDurableStorage();
   const env = {
