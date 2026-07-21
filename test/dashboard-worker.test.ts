@@ -3321,7 +3321,7 @@ test("exact-review queue coalesces deliveries, dispatches a bound rollout snapsh
     assert.equal(requeued.items["openclaw/gogcli#597"].decision.statusCommentId, undefined);
     assert.equal(requeued.items["openclaw/gogcli#597"].decision.additionalPrompt, undefined);
     assert.equal(requeued.items["openclaw/gogcli#597"].attempts, 0);
-    assert.ok(requeued.items["openclaw/gogcli#597"].nextAttemptAt >= Date.now());
+    assert.ok(requeued.items["openclaw/gogcli#597"].nextAttemptAt <= Date.now());
     stats = await (
       await queue.fetch(new Request("https://clawsweeper-exact-review-queue/stats"))
     ).json();
