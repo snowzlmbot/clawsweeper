@@ -618,6 +618,77 @@ test("batch claim cannot exceed the configured rollout size", async () => {
   }
 });
 
+test("current queue identity retains cross-run publication artifacts for the same source snapshot", async () => {
+  const originalNow = Date.now;
+  Date.now = () => 6_100_000;
+  try {
+    const storage = new TestStorage();
+    const queue = new ExactReviewQueue(
+      { storage },
+      { EXACT_REVIEW_PUBLICATION_BATCHING_ENABLED: "1" },
+    );
+    await queue.fetch(publicationRequest("delivery-semantic-old", 108676, "2101"));
+    await queue.fetch(publicationRequest("delivery-semantic-new", 108676, "2102"));
+
+    const stats = await (await queue.fetch(new Request("https://queue/stats"))).json();
+    const rows = Array.from(
+      storage.sql.exec(
+        `SELECT item_key, item_json FROM exact_review_queue_items
+          WHERE item_key LIKE 'openclaw/openclaw#108676@publish:%'
+          ORDER BY item_key`,
+      ),
+    ) as Array<{ item_key: string; item_json: string }>;
+    const snapshots = rows.map((row) => {
+      const item = JSON.parse(row.item_json);
+      return {
+        itemKey: row.item_key,
+        sourceSha: item.decision.publication.sourceSha,
+        producerRunId: item.decision.publication.producerRunId,
+        targetRepo: item.decision.targetRepo,
+        itemNumber: item.decision.itemNumber,
+      };
+    });
+
+    assert.equal(stats.lanes.publication.pending, 2);
+    assert.deepEqual(
+      snapshots.map(({ sourceSha, targetRepo, itemNumber }) => ({
+        sourceSha,
+        targetRepo,
+        itemNumber,
+      })),
+      [
+        {
+          sourceSha: "a".repeat(40),
+          targetRepo: "openclaw/openclaw",
+          itemNumber: 108676,
+        },
+        {
+          sourceSha: "a".repeat(40),
+          targetRepo: "openclaw/openclaw",
+          itemNumber: 108676,
+        },
+      ],
+    );
+    assert.deepEqual(
+      snapshots.map(({ producerRunId }) => producerRunId),
+      ["2101", "2102"],
+    );
+    console.log(
+      JSON.stringify({
+        publicationPending: stats.lanes.publication.pending,
+        semanticIdentity: {
+          targetRepo: snapshots[0]?.targetRepo,
+          itemNumber: snapshots[0]?.itemNumber,
+          sourceSha: snapshots[0]?.sourceSha,
+        },
+        retainedKeys: snapshots.map(({ itemKey }) => itemKey),
+      }),
+    );
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
 test("rollout dispatches one full batch workflow without admitting legacy publishers", async () => {
   const originalFetch = globalThis.fetch;
   const originalNow = Date.now;
