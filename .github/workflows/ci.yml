@@ -23,6 +23,7 @@ concurrency:
 jobs:
   check:
     name: pnpm check
+    if: github.ref != 'refs/heads/evidence/issue-publication-semantic-duplicates'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -73,7 +74,7 @@ jobs:
 
   sparse-repair-builds:
     name: sparse repair build smoke
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && github.ref != 'refs/heads/evidence/issue-publication-semantic-duplicates'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -86,6 +87,7 @@ jobs:
 
   crawl-remote-toolchain:
     name: crawl-remote toolchain integration
+    if: github.ref != 'refs/heads/evidence/issue-publication-semantic-duplicates'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -159,6 +161,7 @@ jobs:
 
   windows-codex-launch:
     name: Windows Codex launcher
+    if: github.ref != 'refs/heads/evidence/issue-publication-semantic-duplicates'
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
@@ -176,3 +179,20 @@ jobs:
           node --test --test-name-pattern
           "escaped Windows launchers|extensionless Windows node shebang shims|CODEX_BIN and preserves argv|timeout errors|app-server mode"
           test/codex-process.test.ts
+
+  publication-semantic-duplicate-evidence:
+    name: publication semantic duplicate reproduction
+    if: github.ref == 'refs/heads/evidence/issue-publication-semantic-duplicates'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-pnpm
+      - name: Reproduce cross-run publication retention
+        run: >-
+          node --test --test-name-pattern="current queue identity retains cross-run publication artifacts for the same source snapshot"
+          test/exact-review-publication-batches.test.ts
+      - name: Verify queue identity source
+        run: |
+          grep -n -F 'producerRunId}:${decision.publication.producerRunAttempt}' dashboard/exact-review-queue.ts
+          grep -n -F 'item.key > cursor' dashboard/exact-review-queue.ts
