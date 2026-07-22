@@ -310,6 +310,7 @@ test("superseding source revisions revoke the old lease and cancel its Actions r
       return jsonResponse({ token: "actions-write-token" });
     }
     if (url.pathname === "/repos/openclaw/clawsweeper/actions/runs/7530/cancel") {
+      assert.ok((await storage.getAlarm()) !== null);
       cancelled.push(url.pathname);
       return new Response(null, { status: 202 });
     }
@@ -353,6 +354,29 @@ test("superseding source revisions revoke the old lease and cancel its Actions r
     assert.equal(current.leaseDecision, undefined);
     assert.equal((current.decision as Record<string, unknown>).sourceAction, "synchronize");
     assert.equal((current.decision as Record<string, unknown>).commandStatusMarker, undefined);
+    const stats = await (
+      await queue.fetch(new Request("https://clawsweeper-exact-review-queue/stats"))
+    ).json();
+    assert.equal(stats.lanes.review.superseded_total, 1);
+    assert.deepEqual(
+      Array.from(
+        storage.sql.exec(
+          `SELECT item_key, prior_revision, next_revision, superseded_run_id,
+                  source_action, superseded_at
+             FROM exact_review_queue_supersessions`,
+        ),
+      ),
+      [
+        {
+          item_key: "openclaw/openclaw#753",
+          prior_revision: 1,
+          next_revision: 2,
+          superseded_run_id: "7530",
+          source_action: "synchronize",
+          superseded_at: now,
+        },
+      ],
+    );
 
     const staleCompletion = await queue.fetch(
       new Request("https://clawsweeper-exact-review-queue/complete", {
@@ -373,6 +397,56 @@ test("superseding source revisions revoke the old lease and cancel its Actions r
   } finally {
     globalThis.fetch = originalFetch;
     Date.now = originalNow;
+  }
+});
+
+test("recovery revisions cannot supersede an active authoritative exact review", async () => {
+  const originalFetch = globalThis.fetch;
+  const storage = new MemoryDurableStorage();
+  const active = leasedExactReviewQueueItem(754, "7540");
+  active.decision.sourceAction = "synchronize";
+  active.leaseDecision.sourceAction = "synchronize";
+  await storage.put("exact-review-queue", {
+    deliveries: {},
+    items: { "openclaw/openclaw#754": active },
+  });
+  globalThis.fetch = async (input) => {
+    throw new Error(`unexpected cancellation request ${String(input)}`);
+  };
+
+  try {
+    const queue = new ExactReviewQueue({ storage }, {});
+    for (const sourceAction of [
+      "failed_review_shard_recovery",
+      "artifact_retention_recovery",
+      "source_drift_requeue",
+    ]) {
+      const response = await queue.fetch(
+        buildExactReviewQueueRequest(
+          `stale-recovery-${sourceAction}`,
+          754,
+          sourceAction,
+          "pull_request",
+          "openclaw/openclaw",
+        ),
+      );
+      assert.equal(response.status, 202);
+    }
+
+    const state = (await storage.get("exact-review-queue")) as {
+      items: Record<string, Record<string, unknown>>;
+    };
+    const current = state.items["openclaw/openclaw#754"];
+    assert.equal(current.state, "leased");
+    assert.equal(current.revision, 1);
+    assert.equal(current.claimedRunId, "7540");
+    assert.equal((current.decision as Record<string, unknown>).sourceAction, "synchronize");
+    const stats = await (
+      await queue.fetch(new Request("https://clawsweeper-exact-review-queue/stats"))
+    ).json();
+    assert.equal(stats.lanes.review.superseded_total, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });
 
@@ -3091,12 +3165,14 @@ test("exact-review queue upgrades flow metrics without losing publication comple
     {
       review_enqueued: stats.lanes.review.enqueued_total,
       review_completed: stats.lanes.review.completed_total,
+      review_superseded: stats.lanes.review.superseded_total,
       publication_enqueued: stats.lanes.publication.enqueued_total,
       publication_completed: stats.lanes.publication.completed_total,
     },
     {
       review_enqueued: 0,
       review_completed: 0,
+      review_superseded: 0,
       publication_enqueued: 0,
       publication_completed: 42,
     },
