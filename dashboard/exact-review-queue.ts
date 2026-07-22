@@ -210,7 +210,7 @@ type ExactReviewQueueStorageMeta = {
   shed_since_reset?: number;
 };
 type ExactReviewQueueMetricTotals = {
-  review: { enqueued: number; completed: number };
+  review: { enqueued: number; completed: number; superseded: number };
   publication: {
     enqueued: number;
     completed: number;
@@ -225,6 +225,7 @@ type ExactReviewQueueMetricTotals = {
 type ExactReviewQueueMetricDelta = {
   reviewEnqueued?: number;
   reviewCompleted?: number;
+  reviewSuperseded?: number;
   reviewRetried?: number;
   reviewShed?: number;
   publicationEnqueued?: number;
@@ -252,6 +253,14 @@ type StateAppendWindowRow = {
   payload_bytes: number;
   produced_at: string;
   delivery_id: string;
+};
+type ExactReviewSupersessionAudit = {
+  itemKey: string;
+  priorRevision: number;
+  nextRevision: number;
+  supersededRunId: string | null;
+  sourceAction: string;
+  supersededAt: number;
 };
 export type DurableObjectStub = { fetch: (request: Request) => Promise<Response> };
 export type DurableObjectNamespace = {
@@ -321,6 +330,7 @@ const EXACT_REVIEW_QUEUE_ITEM_TABLE = "exact_review_queue_items";
 const EXACT_REVIEW_QUEUE_DELIVERY_TABLE = "exact_review_queue_deliveries";
 const EXACT_REVIEW_QUEUE_METRICS_TABLE = "exact_review_queue_metrics";
 const EXACT_REVIEW_QUEUE_METRIC_BUCKET_TABLE = "exact_review_queue_metric_buckets";
+const EXACT_REVIEW_QUEUE_SUPERSESSION_TABLE = "exact_review_queue_supersessions";
 const EXACT_REVIEW_QUEUE_DEAD_LETTER_TABLE = "exact_review_queue_dead_letters";
 const EXACT_REVIEW_PUBLICATION_HEAD_TABLE = "exact_review_publication_heads";
 const STATE_APPEND_WINDOW_TABLE = "state_append_window";
@@ -350,6 +360,7 @@ const EXACT_REVIEW_QUEUE_DEAD_LETTER_LIMIT = 5_000;
 const EXACT_REVIEW_QUEUE_DEAD_LETTER_RESOLVED_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const EXACT_REVIEW_QUEUE_METRIC_BUCKET_MS = 5 * 60 * 1000;
 const EXACT_REVIEW_QUEUE_METRIC_BUCKET_TTL_MS = 48 * 60 * 60 * 1000;
+const EXACT_REVIEW_QUEUE_SUPERSESSION_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const EXACT_REVIEW_PUBLICATION_CONTROL_KEY = "exact-review-publication-control:v1";
 export const EXACT_REVIEW_QUEUE_NAME = "global";
 const EXACT_REVIEW_COMMAND_STATUS_MARKER_PATTERN =
@@ -819,9 +830,9 @@ export class ExactReviewQueue {
         const key = exactReviewItemKey(decision);
         const current = state.items[key];
         let supersededRunId: string | null = null;
+        let supersessionAudit: ExactReviewSupersessionAudit | null = null;
         if (current) {
-          const ignoredRecovery =
-            decision.sourceAction === FAILED_REVIEW_SHARD_RECOVERY_SOURCE_ACTION;
+          const ignoredRecovery = isLowPriorityExactReviewDecision(decision);
           // A recovery is only a one-shot repair of a failed shard. It may create a queue item,
           // but must never supersede an existing pending, dispatching, or leased decision: doing
           // so can leave either ordinary work or another recovery as a stale follow-up revision.
@@ -833,7 +844,16 @@ export class ExactReviewQueue {
               !exactReviewQueueIsPublication(current) &&
               (current.state === "dispatching" || current.state === "leased");
             if (supersedesActiveReview) {
+              const priorRevision = current.revision;
               supersededRunId = current.claimedRunId || null;
+              supersessionAudit = {
+                itemKey: key,
+                priorRevision,
+                nextRevision: priorRevision + 1,
+                supersededRunId,
+                sourceAction: decision.sourceAction,
+                supersededAt: now,
+              };
               clearExactReviewLease(current);
               current.state = "pending";
               current.createdAt = now;
@@ -897,6 +917,10 @@ export class ExactReviewQueue {
             publicationSuperseded: supersededPublications,
           });
         }
+        if (supersessionAudit) {
+          this.insertSupersessionAuditSync(supersessionAudit);
+          this.incrementQueueMetricsSync({ reviewSuperseded: 1 });
+        }
         return {
           deduped: false as const,
           key,
@@ -935,10 +959,10 @@ export class ExactReviewQueue {
       if (accepted.shed) {
         return json({ ok: true, shed: true, reason: "backpressure" }, 202);
       }
+      await this.scheduleNext(accepted.state, now);
       if (accepted.supersededRunId) {
         await cancelSupersededExactReviewRun(this.env, accepted.supersededRunId);
       }
-      await this.scheduleNext(accepted.state, now);
       return json(
         {
           ok: true,
@@ -1670,6 +1694,7 @@ export class ExactReviewQueue {
             ...stats.lanes.review,
             enqueued_total: metrics.review.enqueued,
             completed_total: metrics.review.completed,
+            superseded_total: metrics.review.superseded,
             flow: reviewFlow,
           },
           publication: {
@@ -3429,6 +3454,8 @@ export class ExactReviewQueue {
          singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
          review_enqueued_total INTEGER NOT NULL DEFAULT 0 CHECK (review_enqueued_total >= 0),
          review_completed_total INTEGER NOT NULL DEFAULT 0 CHECK (review_completed_total >= 0),
+         review_superseded_total INTEGER NOT NULL DEFAULT 0
+           CHECK (review_superseded_total >= 0),
          publication_enqueued_total INTEGER NOT NULL DEFAULT 0
            CHECK (publication_enqueued_total >= 0),
          publication_completed_total INTEGER NOT NULL CHECK (publication_completed_total >= 0)
@@ -3437,6 +3464,7 @@ export class ExactReviewQueue {
     for (const column of [
       "review_enqueued_total",
       "review_completed_total",
+      "review_superseded_total",
       "publication_enqueued_total",
       "publication_published_total",
       "publication_superseded_total",
@@ -3469,10 +3497,26 @@ export class ExactReviewQueue {
          ON ${EXACT_REVIEW_QUEUE_DELIVERY_TABLE} (received_at, delivery_id)`,
     );
     this.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS ${EXACT_REVIEW_QUEUE_SUPERSESSION_TABLE} (
+         item_key TEXT NOT NULL,
+         prior_revision INTEGER NOT NULL CHECK (prior_revision >= 1),
+         next_revision INTEGER NOT NULL CHECK (next_revision > prior_revision),
+         superseded_run_id TEXT,
+         source_action TEXT NOT NULL,
+         superseded_at INTEGER NOT NULL,
+         PRIMARY KEY (item_key, prior_revision, next_revision)
+       ) STRICT`,
+    );
+    this.storage.sql.exec(
+      `CREATE INDEX IF NOT EXISTS exact_review_queue_supersessions_at
+         ON ${EXACT_REVIEW_QUEUE_SUPERSESSION_TABLE} (superseded_at, item_key)`,
+    );
+    this.storage.sql.exec(
       `CREATE TABLE IF NOT EXISTS ${EXACT_REVIEW_QUEUE_METRIC_BUCKET_TABLE} (
          bucket_start INTEGER PRIMARY KEY,
          review_enqueued INTEGER NOT NULL DEFAULT 0 CHECK (review_enqueued >= 0),
          review_completed INTEGER NOT NULL DEFAULT 0 CHECK (review_completed >= 0),
+         review_superseded INTEGER NOT NULL DEFAULT 0 CHECK (review_superseded >= 0),
          review_retried INTEGER NOT NULL DEFAULT 0 CHECK (review_retried >= 0),
          review_shed INTEGER NOT NULL DEFAULT 0 CHECK (review_shed >= 0),
          publication_enqueued INTEGER NOT NULL DEFAULT 0 CHECK (publication_enqueued >= 0),
@@ -3489,6 +3533,7 @@ export class ExactReviewQueue {
     for (const column of [
       "review_enqueued",
       "review_completed",
+      "review_superseded",
       "review_retried",
       "review_shed",
       "publication_semantic_deduped",
@@ -3988,7 +4033,7 @@ export class ExactReviewQueue {
   private queueMetricTotalsSync(): ExactReviewQueueMetricTotals {
     const row = Array.from(
       this.storage.sql.exec(
-        `SELECT review_enqueued_total, review_completed_total,
+        `SELECT review_enqueued_total, review_completed_total, review_superseded_total,
                 publication_enqueued_total, publication_completed_total,
                 publication_published_total, publication_superseded_total,
                 publication_semantic_deduped_total,
@@ -4001,6 +4046,7 @@ export class ExactReviewQueue {
       | {
           review_enqueued_total?: number;
           review_completed_total?: number;
+          review_superseded_total?: number;
           publication_enqueued_total?: number;
           publication_completed_total?: number;
           publication_published_total?: number;
@@ -4015,6 +4061,7 @@ export class ExactReviewQueue {
       review: {
         enqueued: exactReviewMetricTotal(row?.review_enqueued_total),
         completed: exactReviewMetricTotal(row?.review_completed_total),
+        superseded: exactReviewMetricTotal(row?.review_superseded_total),
       },
       publication: {
         enqueued: exactReviewMetricTotal(row?.publication_enqueued_total),
@@ -4032,6 +4079,7 @@ export class ExactReviewQueue {
   private incrementQueueMetricsSync(delta: ExactReviewQueueMetricDelta) {
     const reviewEnqueued = exactReviewMetricDelta(delta.reviewEnqueued);
     const reviewCompleted = exactReviewMetricDelta(delta.reviewCompleted);
+    const reviewSuperseded = exactReviewMetricDelta(delta.reviewSuperseded);
     const reviewRetried = exactReviewMetricDelta(delta.reviewRetried);
     const reviewShed = exactReviewMetricDelta(delta.reviewShed);
     const publicationEnqueued = exactReviewMetricDelta(delta.publicationEnqueued);
@@ -4045,6 +4093,7 @@ export class ExactReviewQueue {
     if (
       !reviewEnqueued &&
       !reviewCompleted &&
+      !reviewSuperseded &&
       !reviewRetried &&
       !reviewShed &&
       !publicationEnqueued &&
@@ -4062,6 +4111,7 @@ export class ExactReviewQueue {
       `UPDATE ${EXACT_REVIEW_QUEUE_METRICS_TABLE}
           SET review_enqueued_total = review_enqueued_total + ?,
               review_completed_total = review_completed_total + ?,
+              review_superseded_total = review_superseded_total + ?,
               publication_enqueued_total = publication_enqueued_total + ?,
               publication_completed_total = publication_completed_total + ?,
               publication_published_total = publication_published_total + ?,
@@ -4073,6 +4123,7 @@ export class ExactReviewQueue {
         WHERE singleton_id = 1`,
       reviewEnqueued,
       reviewCompleted,
+      reviewSuperseded,
       publicationEnqueued,
       publicationCompleted,
       publicationPublished,
@@ -4085,6 +4136,7 @@ export class ExactReviewQueue {
     this.incrementQueueMetricBucketSync({
       reviewEnqueued,
       reviewCompleted,
+      reviewSuperseded,
       reviewRetried,
       reviewShed,
       publicationEnqueued,
@@ -4100,6 +4152,7 @@ export class ExactReviewQueue {
   private incrementQueueMetricBucketSync({
     reviewEnqueued,
     reviewCompleted,
+    reviewSuperseded,
     reviewRetried,
     reviewShed,
     publicationEnqueued,
@@ -4112,6 +4165,7 @@ export class ExactReviewQueue {
   }: {
     reviewEnqueued: number;
     reviewCompleted: number;
+    reviewSuperseded: number;
     reviewRetried: number;
     reviewShed: number;
     publicationEnqueued: number;
@@ -4125,6 +4179,7 @@ export class ExactReviewQueue {
     if (
       !reviewEnqueued &&
       !reviewCompleted &&
+      !reviewSuperseded &&
       !reviewRetried &&
       !reviewShed &&
       !publicationEnqueued &&
@@ -4142,14 +4197,16 @@ export class ExactReviewQueue {
       EXACT_REVIEW_QUEUE_METRIC_BUCKET_MS;
     this.storage.sql.exec(
       `INSERT INTO ${EXACT_REVIEW_QUEUE_METRIC_BUCKET_TABLE}
-         (bucket_start, review_enqueued, review_completed, review_retried, review_shed,
+         (bucket_start, review_enqueued, review_completed, review_superseded, review_retried,
+          review_shed,
           publication_enqueued, publication_resolved, publication_published,
           publication_superseded, publication_semantic_deduped,
           publication_retried, publication_dead_lettered)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(bucket_start) DO UPDATE SET
          review_enqueued = review_enqueued + excluded.review_enqueued,
          review_completed = review_completed + excluded.review_completed,
+         review_superseded = review_superseded + excluded.review_superseded,
          review_retried = review_retried + excluded.review_retried,
          review_shed = review_shed + excluded.review_shed,
          publication_enqueued = publication_enqueued + excluded.publication_enqueued,
@@ -4164,6 +4221,7 @@ export class ExactReviewQueue {
       bucketStart,
       reviewEnqueued,
       reviewCompleted,
+      reviewSuperseded,
       reviewRetried,
       reviewShed,
       publicationEnqueued,
@@ -4223,6 +4281,21 @@ export class ExactReviewQueue {
       deadLetter.lastFailedAt,
       deadLetter.itemJson,
       deadLetter.errorFingerprint || null,
+    );
+  }
+
+  private insertSupersessionAuditSync(audit: ExactReviewSupersessionAudit) {
+    this.storage.sql.exec(
+      `INSERT OR IGNORE INTO ${EXACT_REVIEW_QUEUE_SUPERSESSION_TABLE}
+         (item_key, prior_revision, next_revision, superseded_run_id,
+          source_action, superseded_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      audit.itemKey,
+      audit.priorRevision,
+      audit.nextRevision,
+      audit.supersededRunId,
+      audit.sourceAction,
+      audit.supersededAt,
     );
   }
 
@@ -4302,6 +4375,10 @@ export class ExactReviewQueue {
       `DELETE FROM ${EXACT_REVIEW_QUEUE_DEAD_LETTER_TABLE}
         WHERE status != 'open' AND resolved_at < ?`,
       now - EXACT_REVIEW_QUEUE_DEAD_LETTER_RESOLVED_TTL_MS,
+    );
+    this.storage.sql.exec(
+      `DELETE FROM ${EXACT_REVIEW_QUEUE_SUPERSESSION_TABLE} WHERE superseded_at < ?`,
+      now - EXACT_REVIEW_QUEUE_SUPERSESSION_RETENTION_MS,
     );
     this.storage.sql.exec(
       `DELETE FROM ${EXACT_REVIEW_STATE_WRITER_OPERATION_TABLE} WHERE observed_at < ?`,
@@ -7415,8 +7492,8 @@ async function cancelSupersededExactReviewRun(env, runId: string) {
       errorLabel: "Superseded ClawSweeper run cancellation",
     });
   } catch (error) {
-    // The queue revision and workflow concurrency remain authoritative when the
-    // best-effort API cancellation races a terminal run or GitHub is unavailable.
+    // The queue revision remains authoritative when the best-effort API
+    // cancellation races a terminal run or GitHub is unavailable.
     console.warn(
       `superseded exact-review run ${runId} could not be cancelled`,
       error instanceof Error ? error.message : String(error),
