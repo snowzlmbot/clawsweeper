@@ -365,6 +365,7 @@ test("superseding source revisions revoke the old lease and cancel its Actions r
                   source_action, superseded_at
              FROM exact_review_queue_supersessions`,
         ),
+        (row) => ({ ...row }),
       ),
       [
         {
