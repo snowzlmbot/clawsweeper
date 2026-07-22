@@ -182,9 +182,14 @@ revisions extend that delay up to `EXACT_REVIEW_DISPATCH_DEBOUNCE_MAX_MS` (three
 minutes by default) from the item's first enqueue. A superseding source event
 immediately revokes the old queue lease, best-effort cancels its claimed Actions
 run by exact run id, and starts a fresh debounce window for the latest revision.
-An older unclaimed workflow cannot pass the replacement lease tuple and exits
-before review compute. Explicit command work and publication work bypass the
-delay. When pending depth reaches
+The replacement is durably scheduled before cancellation is attempted, and
+`review_superseded_total` records the terminalized review generation. Recovery
+events never supersede an existing item; only a fresh source revision can revoke
+an active review. Duplicate workflow deliveries remain non-cancelling and rely
+on the lease claim tuple, so they cannot terminate the sole valid owner. An older
+unclaimed workflow cannot pass the replacement lease tuple and exits before
+review compute. Explicit command work and publication work bypass the delay.
+When pending depth reaches
 `EXACT_REVIEW_PENDING_SOFT_LIMIT` (300 by default), new recovery-only work is
 shed; existing items, webhook events, commands, and publications remain admitted.
 
