@@ -3,13 +3,19 @@ import { ExactReviewBatchQueueClient } from "./exact-review-batch-queue-client.j
 
 const apply = process.argv.includes("--apply");
 const maxItems = integerArg("--max-items", 100, 1, 100);
+const requestedPasses = integerArg("--passes", 1, 1, 100);
 const client = new ExactReviewBatchQueueClient({
   baseUrl: env("EXACT_REVIEW_QUEUE_URL"),
   webhookSecret: env("CLAWSWEEPER_WEBHOOK_SECRET"),
 });
 
+if (requestedPasses > 1) {
+  console.error(
+    `--passes=${requestedPasses} is deprecated and clamped to one observed pass per invocation`,
+  );
+}
 const result = await client.reconcilePublications({ apply, maxItems });
-console.log(JSON.stringify({ ok: true, ...result }));
+console.log(JSON.stringify({ ok: true, requestedPasses, effectivePasses: 1, ...result }));
 
 function integerArg(name: string, fallback: number, minimum: number, maximum: number): number {
   const index = process.argv.indexOf(name);

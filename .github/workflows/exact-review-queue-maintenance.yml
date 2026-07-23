@@ -8,6 +8,11 @@ on:
         required: true
         type: boolean
         default: false
+      passes:
+        description: "Deprecated compatibility input; accepted but clamped to one pass"
+        required: true
+        type: string
+        default: "1"
 
 concurrency:
   group: exact-review-queue-maintenance
@@ -38,9 +43,11 @@ jobs:
       - name: Preview or reconcile historical publication lineages
         env:
           EXECUTE: ${{ inputs.execute }}
+          PASSES: ${{ inputs.passes }}
         run: |
           args=(--max-items 100)
           if [[ "$EXECUTE" == "true" ]]; then
             args+=(--apply)
           fi
+          args+=(--passes "$PASSES")
           pnpm run --silent repair:exact-review-queue-maintenance -- "${args[@]}"
