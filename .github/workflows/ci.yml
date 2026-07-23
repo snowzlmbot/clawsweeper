@@ -199,7 +199,15 @@ jobs:
           --test-name-pattern="publication reconcile backfills historical duplicate lineages in bounded passes|publication lineage reconcile preserves active batch ownership"
           test/exact-review-publication-batches.test.ts
 
-      - name: Prove one-pass dry-run workflow contract
+      - name: Capture authenticated dry-run transcript
+        env:
+          CLAWSWEEPER_EVIDENCE_TRANSCRIPT: "1"
+        run: >-
+          node --test
+          --test-name-pattern="authenticated publication reconciliation dry-run reports without mutation"
+          test/exact-review-publication-batches.test.ts
+
+      - name: Prove one-pass compatibility workflow contract
         run: node --test test/repair/exact-review-queue-maintenance-workflow.test.ts
 
       - name: Verify changed-surface formatting and lint
