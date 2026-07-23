@@ -20771,6 +20771,7 @@ function postReviewStartStatusComment(options: {
   shardCount: number;
   purpose?: "review" | "apply";
   queueAuthority?: ExactReviewQueueAuthority | null;
+  allowSupersededLeaseCleanup?: boolean;
 }): ReviewStartStatusCommentResult {
   const startedAtMs = Date.now();
   const leaseOwner = newReviewStartLeaseOwner();
@@ -20885,12 +20886,19 @@ function postReviewStartStatusComment(options: {
     // cannot be selected by a stale caller: if its lease is already present,
     // the live revision/queue tuple has moved; if it starts later, it is absent
     // from this immutable snapshot.
-    reapSupersededDedicatedReviewStartLeases(
-      options.item.number,
-      confirmedState.dedicatedLeaseComments,
-      normalizedHead,
-      authoritativeHead,
-    );
+    if (options.allowSupersededLeaseCleanup) {
+      reapSupersededDedicatedReviewStartLeases(
+        options.item.number,
+        confirmedState.dedicatedLeaseComments,
+        normalizedHead,
+        authoritativeHead,
+      );
+    } else if (pullRequestHeadSha(options.item.number) !== normalizedHead) {
+      deleteOwnedDedicatedReviewStartLease(options.item.number, acquired);
+      throw new Error(
+        `review revision changed while reserving #${options.item.number}; retry required`,
+      );
+    }
   }
   return {
     status: "posted",
@@ -22833,7 +22841,7 @@ function reserveReviewLeaseCommand(args: Args): void {
     );
   }
   if (
-    queueAuthority &&
+    queueAuthority?.sourceHeadSha &&
     item.kind === "pull_request" &&
     queueAuthority.sourceHeadSha !== currentRevision
   ) {
@@ -22841,6 +22849,10 @@ function reserveReviewLeaseCommand(args: Args): void {
       "Exact-review queue authority source head does not match the current pull request.",
     );
   }
+  const reservationAuthority =
+    queueAuthority && item.kind === "pull_request" && !queueAuthority.sourceHeadSha
+      ? { ...queueAuthority, sourceHeadSha: currentRevision }
+      : queueAuthority;
   const result = postReviewStartStatusComment({
     item,
     headSha: currentRevision,
@@ -22849,7 +22861,9 @@ function reserveReviewLeaseCommand(args: Args): void {
     total: 1,
     shardIndex: 0,
     shardCount: 1,
-    queueAuthority,
+    queueAuthority: reservationAuthority,
+    allowSupersededLeaseCleanup:
+      item.kind !== "pull_request" || Boolean(queueAuthority?.sourceHeadSha),
   });
   if (result.status === "held") {
     console.log(JSON.stringify({ status: "held", retryAt: result.retryAt }));

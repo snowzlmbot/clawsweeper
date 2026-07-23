@@ -57,6 +57,9 @@ export type ExactReviewBaseDecision = {
   sourceAction: string;
   supersedesInProgress: boolean;
   sourceHeadSha?: string;
+  sourceHeadVerified?: boolean;
+  sourceAuthoritySeq?: number;
+  sourceUpdatedAt?: string;
   codexTimeoutMs?: number;
   mediaProofTimeoutMs?: number;
   commandStatusMarker?: string;
@@ -223,6 +226,14 @@ type ExactReviewQueueMetricTotals = {
     refreshed: number;
   };
 };
+type ExactReviewSourceAuthorityReservation = {
+  deliveryId: string;
+  decision: ExactReviewDecision;
+  installationId: number;
+  sourceAuthoritySeq: number;
+  attempts: number;
+  nextAttemptAt: number;
+};
 type ExactReviewQueueMetricDelta = {
   reviewEnqueued?: number;
   reviewCompleted?: number;
@@ -326,6 +337,12 @@ const EXACT_REVIEW_QUEUE_LEGACY_RECEIPT_SHIFT_MS = 2 * 24 * 60 * 60 * 1000;
 const EXACT_REVIEW_QUEUE_ROLLBACK_CLOCK_SKEW_MS = 5 * 60 * 1000;
 const EXACT_REVIEW_QUEUE_LEGACY_GENERATION_PREFIX = "__clawsweeper_sql_generation:";
 const EXACT_REVIEW_QUEUE_STATE_KEY = "exact-review-queue";
+const EXACT_REVIEW_SOURCE_AUTHORITY_SEQUENCE_KEY = "exact-review-source-authority-sequence:v1";
+const EXACT_REVIEW_SOURCE_AUTHORITY_RESERVATION_PREFIX =
+  "exact-review-source-authority-reservation:v1:";
+const EXACT_REVIEW_SOURCE_AUTHORITY_RETRY_LIMIT = 16;
+const EXACT_REVIEW_SOURCE_AUTHORITY_RETRY_BASE_MS = 15_000;
+const EXACT_REVIEW_SOURCE_AUTHORITY_RETRY_MAX_MS = 15 * 60_000;
 const EXACT_REVIEW_QUEUE_META_TABLE = "exact_review_queue_meta";
 const EXACT_REVIEW_QUEUE_ITEM_TABLE = "exact_review_queue_items";
 const EXACT_REVIEW_QUEUE_DELIVERY_TABLE = "exact_review_queue_deliveries";
@@ -408,6 +425,111 @@ export class ExactReviewQueue {
     await this.ready;
     this.cleanupLegacyCompatibilitySync();
     const url = new URL(request.url);
+    if (request.method === "POST" && url.pathname === "/source-authority") {
+      const body = objectValue(await request.json().catch(() => null));
+      const deliveryId = String(body.delivery_id || "").trim();
+      const decision = exactReviewDecisionFrom(body.decision);
+      const installationId = Number(body.installation_id);
+      if (
+        !deliveryId ||
+        deliveryId.length > 200 ||
+        !decision ||
+        decision.itemKind !== "pull_request" ||
+        decision.publication ||
+        !Number.isInteger(installationId) ||
+        installationId <= 0
+      ) {
+        return json({ error: "invalid_source_authority_reservation" }, 400);
+      }
+      const reservationKey = exactReviewSourceAuthorityReservationKey(deliveryId);
+      const now = Date.now();
+      try {
+        const reserved = this.storage.transactionSync(() => {
+          const completed = Array.from(
+            this.storage.sql.exec(
+              `SELECT delivery_id FROM ${EXACT_REVIEW_QUEUE_DELIVERY_TABLE}
+                WHERE delivery_id = ?`,
+              deliveryId,
+            ),
+          ).length;
+          if (completed) return { deduped: true as const };
+          const existing = exactReviewSourceAuthorityReservationFrom(
+            this.storage.kv.get(reservationKey),
+          );
+          if (existing) {
+            if (
+              existing.deliveryId !== deliveryId ||
+              existing.installationId !== installationId ||
+              stableJson(exactReviewDecisionWithoutSourceAuthority(existing.decision)) !==
+                stableJson(decision)
+            ) {
+              throw new Error("conflicting exact-review source authority reservation");
+            }
+            return { deduped: false as const, reservation: existing };
+          }
+          const stored = this.storage.kv.get(EXACT_REVIEW_SOURCE_AUTHORITY_SEQUENCE_KEY);
+          const current = stored === undefined ? 0 : Number(stored);
+          if (!Number.isSafeInteger(current) || current < 0 || current >= Number.MAX_SAFE_INTEGER) {
+            throw new Error("invalid exact-review source authority sequence");
+          }
+          const next = current + 1;
+          this.storage.kv.put(EXACT_REVIEW_SOURCE_AUTHORITY_SEQUENCE_KEY, next);
+          const created: ExactReviewSourceAuthorityReservation = {
+            deliveryId,
+            decision: { ...decision, sourceAuthoritySeq: next },
+            installationId,
+            sourceAuthoritySeq: next,
+            attempts: 0,
+            nextAttemptAt: now,
+          };
+          this.storage.kv.put(reservationKey, created);
+          return { deduped: false as const, reservation: created };
+        });
+        if (reserved.deduped) return json({ ok: true, deduped: true });
+        await this.scheduleSourceAuthorityVerification(reserved.reservation.nextAttemptAt);
+        return json({
+          ok: true,
+          source_authority_seq: reserved.reservation.sourceAuthoritySeq,
+        });
+      } catch {
+        return json({ error: "source_authority_unavailable" }, 409);
+      }
+    }
+    if (request.method === "POST" && url.pathname === "/source-authority/complete") {
+      const body = objectValue(await request.json().catch(() => null));
+      const deliveryId = String(body.delivery_id || "").trim();
+      const sourceAuthoritySeq = Number(body.source_authority_seq);
+      const disposition = String(body.disposition || "");
+      if (
+        !deliveryId ||
+        !Number.isSafeInteger(sourceAuthoritySeq) ||
+        sourceAuthoritySeq <= 0 ||
+        (disposition !== "enqueued" && disposition !== "mismatch")
+      ) {
+        return json({ error: "invalid_source_authority_completion" }, 400);
+      }
+      const result = this.storage.transactionSync(() => {
+        const reservationKey = exactReviewSourceAuthorityReservationKey(deliveryId);
+        const reservation = exactReviewSourceAuthorityReservationFrom(
+          this.storage.kv.get(reservationKey),
+        );
+        if (!reservation) return "missing" as const;
+        if (reservation.sourceAuthoritySeq !== sourceAuthoritySeq) return "conflict" as const;
+        if (disposition === "mismatch") {
+          this.storage.sql.exec(
+            `INSERT OR IGNORE INTO ${EXACT_REVIEW_QUEUE_DELIVERY_TABLE}
+             (delivery_id, received_at) VALUES (?, ?)`,
+            deliveryId,
+            Date.now(),
+          );
+        }
+        this.storage.kv.delete(reservationKey);
+        return "completed" as const;
+      });
+      if (result === "conflict") return json({ error: "source_authority_conflict" }, 409);
+      await this.scheduleNext(this.readStateSync(), Date.now());
+      return json({ ok: true, completed: result === "completed" });
+    }
     if (request.method === "POST" && url.pathname === "/state/append") {
       const body = objectValue(await request.json().catch(() => null));
       const deliveryId = String(body.delivery_id || "").trim();
@@ -840,9 +962,23 @@ export class ExactReviewQueue {
           // Ordinary source events retain normal replacement behavior, including the
           // command-context merge for pending items.
           if (!ignoredRecovery) {
+            const attemptsReviewSupersession =
+              !exactReviewQueueIsPublication(current) && decision.itemKind === "pull_request";
+            const sourceAuthorityIsNewer =
+              !attemptsReviewSupersession ||
+              exactReviewDecisionCanSupersedeReview(current, decision);
+            if (attemptsReviewSupersession && !sourceAuthorityIsNewer) {
+              this.writeStateSync(state);
+              return {
+                deduped: true as const,
+                staleSource: true as const,
+                key,
+                state,
+              };
+            }
             const supersedesActiveReview =
+              sourceAuthorityIsNewer &&
               decision.supersedesInProgress &&
-              !exactReviewQueueIsPublication(current) &&
               (current.state === "dispatching" || current.state === "leased");
             if (supersedesActiveReview) {
               const priorRevision = current.revision;
@@ -946,6 +1082,7 @@ export class ExactReviewQueue {
                   semantic_duplicates_removed: accepted.semanticDuplicatesRemoved,
                 }
               : {}),
+            ...("staleSource" in accepted && accepted.staleSource ? { stale_source: true } : {}),
             ...(accepted.superseded
               ? {
                   superseded: true,
@@ -1787,6 +1924,7 @@ export class ExactReviewQueue {
     this.cleanupLegacyCompatibilitySync();
     const startedAt = Date.now();
     await this.storage.deleteAlarm();
+    await this.processSourceAuthorityReservations(startedAt);
     this.storage.transactionSync(() => {
       this.pruneDeliveryReceiptsSync(startedAt);
       this.pruneStateAppendReceiptsSync(startedAt);
@@ -5087,6 +5225,116 @@ export class ExactReviewQueue {
     this.storage.kv.delete(EXACT_REVIEW_QUEUE_STATE_KEY);
   }
 
+  private async processSourceAuthorityReservations(now: number) {
+    const reservations = (await this.sourceAuthorityReservations())
+      .filter((reservation) => reservation.nextAttemptAt <= now)
+      .sort(
+        (left, right) =>
+          left.nextAttemptAt - right.nextAttemptAt ||
+          left.sourceAuthoritySeq - right.sourceAuthoritySeq,
+      )
+      .slice(0, 8);
+    for (const reservation of reservations) {
+      try {
+        const liveHeadSha = await exactReviewSourceAuthorityLiveHead(this.env, reservation);
+        const reservedHeadSha = String(reservation.decision.sourceHeadSha || "").toLowerCase();
+        if (liveHeadSha !== reservedHeadSha) {
+          this.completeSourceAuthorityReservationSync(reservation, "mismatch");
+          continue;
+        }
+        const response = await this.fetch(
+          new Request("https://clawsweeper-exact-review-queue/enqueue", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              delivery_id: reservation.deliveryId,
+              decision: {
+                ...reservation.decision,
+                sourceHeadVerified: true,
+              },
+            }),
+          }),
+        );
+        if (!response.ok) throw new Error(`source authority enqueue failed: ${response.status}`);
+        this.completeSourceAuthorityReservationSync(reservation, "enqueued");
+      } catch (error) {
+        console.warn(
+          "exact-review source authority verification deferred",
+          error instanceof Error ? error.message : String(error),
+        );
+        this.deferSourceAuthorityReservationSync(reservation, Date.now());
+      }
+    }
+  }
+
+  private completeSourceAuthorityReservationSync(
+    expected: ExactReviewSourceAuthorityReservation,
+    disposition: "enqueued" | "mismatch",
+  ) {
+    this.storage.transactionSync(() => {
+      const key = exactReviewSourceAuthorityReservationKey(expected.deliveryId);
+      const current = exactReviewSourceAuthorityReservationFrom(this.storage.kv.get(key));
+      if (current?.sourceAuthoritySeq === expected.sourceAuthoritySeq) {
+        if (disposition === "mismatch") {
+          this.storage.sql.exec(
+            `INSERT OR IGNORE INTO ${EXACT_REVIEW_QUEUE_DELIVERY_TABLE}
+             (delivery_id, received_at) VALUES (?, ?)`,
+            expected.deliveryId,
+            Date.now(),
+          );
+        }
+        this.storage.kv.delete(key);
+      }
+    });
+  }
+
+  private deferSourceAuthorityReservationSync(
+    expected: ExactReviewSourceAuthorityReservation,
+    now: number,
+  ) {
+    this.storage.transactionSync(() => {
+      const key = exactReviewSourceAuthorityReservationKey(expected.deliveryId);
+      const current = exactReviewSourceAuthorityReservationFrom(this.storage.kv.get(key));
+      if (current?.sourceAuthoritySeq !== expected.sourceAuthoritySeq) return;
+      const attempts = Math.min(EXACT_REVIEW_SOURCE_AUTHORITY_RETRY_LIMIT, current.attempts + 1);
+      const backoffMs = Math.min(
+        EXACT_REVIEW_SOURCE_AUTHORITY_RETRY_MAX_MS,
+        EXACT_REVIEW_SOURCE_AUTHORITY_RETRY_BASE_MS * 2 ** Math.max(0, attempts - 1),
+      );
+      this.storage.kv.put(key, {
+        ...current,
+        attempts,
+        nextAttemptAt: now + backoffMs,
+      });
+    });
+  }
+
+  private async sourceAuthorityReservations() {
+    const values = await this.storage.list({
+      prefix: EXACT_REVIEW_SOURCE_AUTHORITY_RESERVATION_PREFIX,
+    });
+    return Array.from(values.values())
+      .map(exactReviewSourceAuthorityReservationFrom)
+      .filter(
+        (reservation): reservation is ExactReviewSourceAuthorityReservation => reservation !== null,
+      );
+  }
+
+  private async nextSourceAuthorityVerificationAt() {
+    return (await this.sourceAuthorityReservations()).reduce<number | null>(
+      (next, reservation) =>
+        next === null ? reservation.nextAttemptAt : Math.min(next, reservation.nextAttemptAt),
+      null,
+    );
+  }
+
+  private async scheduleSourceAuthorityVerification(nextAttemptAt: number) {
+    const scheduled = await this.storage.getAlarm();
+    if (scheduled === null || scheduled <= Date.now() || nextAttemptAt < scheduled) {
+      await this.storage.setAlarm(nextAttemptAt);
+    }
+  }
+
   private async scheduleNext(state: ExactReviewQueueState, now: number) {
     const publicationControl = this.refreshPublicationControlSync(state, now);
     const batchOwnership = this.batchStore.activeLeaseSnapshot(now);
@@ -5125,11 +5373,13 @@ export class ExactReviewQueue {
       now,
       new Set(batchOwnership.itemKeys),
     );
+    const sourceAuthorityNext = await this.nextSourceAuthorityVerificationAt();
     const next = [
       queueNext,
       reviewNext,
       batchOwnership.nextLeaseExpiresAt,
       batchDeparture?.dueAt ?? null,
+      sourceAuthorityNext,
     ]
       .filter((candidate): candidate is number => candidate !== null)
       .reduce<number | null>(
@@ -5173,6 +5423,58 @@ function exactReviewDecisionFrom(value): ExactReviewDecision | null {
   return { ...base, ...(publication ? { publication } : {}) };
 }
 
+function exactReviewDecisionWithoutSourceAuthority(decision: ExactReviewDecision) {
+  const {
+    sourceAuthoritySeq: _sourceAuthoritySeq,
+    sourceHeadVerified: _sourceHeadVerified,
+    ...rest
+  } = decision;
+  return rest;
+}
+
+function exactReviewSourceAuthorityReservationKey(deliveryId: string) {
+  return `${EXACT_REVIEW_SOURCE_AUTHORITY_RESERVATION_PREFIX}${encodeURIComponent(deliveryId)}`;
+}
+
+function exactReviewSourceAuthorityReservationFrom(
+  value,
+): ExactReviewSourceAuthorityReservation | null {
+  const reservation = objectValue(value);
+  const deliveryId = String(reservation.deliveryId || "").trim();
+  const decision = exactReviewDecisionFrom(reservation.decision);
+  const installationId = Number(reservation.installationId);
+  const sourceAuthoritySeq = Number(reservation.sourceAuthoritySeq);
+  const attempts = Number(reservation.attempts);
+  const nextAttemptAt = Number(reservation.nextAttemptAt);
+  if (
+    !deliveryId ||
+    deliveryId.length > 200 ||
+    !decision ||
+    decision.itemKind !== "pull_request" ||
+    decision.publication ||
+    !Number.isInteger(installationId) ||
+    installationId <= 0 ||
+    !Number.isSafeInteger(sourceAuthoritySeq) ||
+    sourceAuthoritySeq <= 0 ||
+    decision.sourceAuthoritySeq !== sourceAuthoritySeq ||
+    !Number.isInteger(attempts) ||
+    attempts < 0 ||
+    attempts > EXACT_REVIEW_SOURCE_AUTHORITY_RETRY_LIMIT ||
+    !Number.isSafeInteger(nextAttemptAt) ||
+    nextAttemptAt < 0
+  ) {
+    return null;
+  }
+  return {
+    deliveryId,
+    decision,
+    installationId,
+    sourceAuthoritySeq,
+    attempts,
+    nextAttemptAt,
+  };
+}
+
 function exactReviewBaseDecisionFrom(value): ExactReviewBaseDecision | null {
   const decision = objectValue(value);
   const targetRepo = String(decision.targetRepo || "").trim();
@@ -5187,6 +5489,15 @@ function exactReviewBaseDecisionFrom(value): ExactReviewBaseDecision | null {
         .trim()
         .toLowerCase()
     : undefined;
+  const hasSourceHeadVerified = Object.hasOwn(decision, "sourceHeadVerified");
+  const hasSourceAuthoritySeq = Object.hasOwn(decision, "sourceAuthoritySeq");
+  const sourceAuthoritySeq = hasSourceAuthoritySeq
+    ? Number(decision.sourceAuthoritySeq)
+    : undefined;
+  const hasSourceUpdatedAt = Object.hasOwn(decision, "sourceUpdatedAt");
+  const sourceUpdatedAt = hasSourceUpdatedAt
+    ? String(decision.sourceUpdatedAt || "").trim()
+    : undefined;
   const hasCommandStatusMarker = Object.hasOwn(decision, "commandStatusMarker");
   const commandStatusMarker = hasCommandStatusMarker ? decision.commandStatusMarker : undefined;
   const hasStatusCommentId = Object.hasOwn(decision, "statusCommentId");
@@ -5200,6 +5511,14 @@ function exactReviewBaseDecisionFrom(value): ExactReviewBaseDecision | null {
   if (sourceEvent !== "issues" && sourceEvent !== "pull_request") return null;
   if (!sourceAction) return null;
   if (hasSourceHeadSha && !/^[0-9a-f]{40}$/.test(sourceHeadSha || "")) return null;
+  if (hasSourceHeadVerified && typeof decision.sourceHeadVerified !== "boolean") return null;
+  if (
+    hasSourceAuthoritySeq &&
+    (!Number.isSafeInteger(sourceAuthoritySeq) || Number(sourceAuthoritySeq) <= 0)
+  ) {
+    return null;
+  }
+  if (hasSourceUpdatedAt && !Number.isFinite(Date.parse(sourceUpdatedAt || ""))) return null;
   if (
     hasCommandStatusMarker &&
     (typeof commandStatusMarker !== "string" ||
@@ -5230,6 +5549,9 @@ function exactReviewBaseDecisionFrom(value): ExactReviewBaseDecision | null {
     sourceAction,
     supersedesInProgress: Boolean(decision.supersedesInProgress),
     ...(hasSourceHeadSha ? { sourceHeadSha } : {}),
+    ...(hasSourceHeadVerified ? { sourceHeadVerified: decision.sourceHeadVerified } : {}),
+    ...(hasSourceAuthoritySeq ? { sourceAuthoritySeq } : {}),
+    ...(hasSourceUpdatedAt ? { sourceUpdatedAt } : {}),
     ...(Number.isFinite(Number(decision.codexTimeoutMs))
       ? { codexTimeoutMs: Number(decision.codexTimeoutMs) }
       : {}),
@@ -5358,6 +5680,51 @@ function mergePendingExactReviewDecision(
     delete merged.statusCommentId;
   }
   return merged;
+}
+
+function exactReviewDecisionCanSupersedeReview(
+  current: ExactReviewQueueItem,
+  incoming: ExactReviewDecision,
+): boolean {
+  const active = current.leaseDecision || current.decision;
+  if (active.itemKind !== "pull_request" || incoming.itemKind !== "pull_request") return true;
+
+  const activeHead = String(active.sourceHeadSha || "").toLowerCase();
+  const incomingHead = String(incoming.sourceHeadSha || "").toLowerCase();
+  if (!/^[0-9a-f]{40}$/.test(incomingHead)) return false;
+  const incomingAuthoritySeq = Number(incoming.sourceAuthoritySeq || 0);
+  const activeSourceAuthoritySeq = Number(active.sourceAuthoritySeq || 0);
+  const activeHasAuthority =
+    Number.isSafeInteger(activeSourceAuthoritySeq) && activeSourceAuthoritySeq > 0;
+  if (!/^[0-9a-f]{40}$/.test(activeHead)) {
+    return (
+      incoming.sourceHeadVerified === true &&
+      Number.isSafeInteger(incomingAuthoritySeq) &&
+      incomingAuthoritySeq > 0
+    );
+  }
+  if (incomingHead !== activeHead && incoming.sourceHeadVerified !== true) {
+    return false;
+  }
+  if (!activeHasAuthority) {
+    if (incomingHead !== activeHead) {
+      return incoming.sourceHeadVerified === true;
+    }
+    return Number.isSafeInteger(incomingAuthoritySeq) && incomingAuthoritySeq > 0;
+  }
+  if (!Number.isSafeInteger(incomingAuthoritySeq) || incomingAuthoritySeq <= 0) return false;
+
+  const activeUpdatedAt = Date.parse(String(active.sourceUpdatedAt || ""));
+  const incomingUpdatedAt = Date.parse(String(incoming.sourceUpdatedAt || ""));
+  if (
+    Number.isFinite(activeUpdatedAt) &&
+    Number.isFinite(incomingUpdatedAt) &&
+    incomingUpdatedAt !== activeUpdatedAt
+  ) {
+    return incomingUpdatedAt > activeUpdatedAt;
+  }
+
+  return incomingAuthoritySeq > activeSourceAuthoritySeq;
 }
 
 function exactReviewItemKey(decision: ExactReviewDecision) {
@@ -7500,6 +7867,32 @@ function stateAppendWindowRowJson(row: StateAppendWindowRow) {
 
 async function exactReviewDispatchToken(env) {
   return exactReviewRepositoryToken(env, { actions: "write", contents: "write" });
+}
+
+async function exactReviewSourceAuthorityLiveHead(
+  env,
+  reservation: ExactReviewSourceAuthorityReservation,
+) {
+  const credentials = githubAppCredentials(env);
+  if (!credentials) throw new Error("github app is not configured");
+  const appJwt = await signGithubAppJwt(credentials.issuer, credentials.privateKey);
+  const token = await createGithubAppTokenFor({
+    appJwt,
+    installationId: reservation.installationId,
+    label: reservation.decision.targetRepo,
+    repositories: [repoName(reservation.decision.targetRepo)],
+    permissions: { pull_requests: "read" },
+  });
+  const pull = await githubTokenJson({
+    token,
+    path: `/repos/${reservation.decision.targetRepo}/pulls/${reservation.decision.itemNumber}`,
+    method: "GET",
+    body: undefined,
+    errorLabel: "live pull request head",
+  });
+  return String(objectValue(objectValue(pull).head).sha || "")
+    .trim()
+    .toLowerCase();
 }
 
 export async function exactReviewActionsReadToken(env) {

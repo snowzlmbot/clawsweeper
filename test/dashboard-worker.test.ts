@@ -39,6 +39,51 @@ test("exact-review queue defaults to 64 of the 128 global workers", () => {
   );
 });
 
+test("exact-review source authority sequence survives queue restarts", async () => {
+  const storage = new MemoryDurableStorage();
+  const queue = new ExactReviewQueue({ storage }, {});
+  const reserve = (target: ExactReviewQueue, deliveryId: string) =>
+    target.fetch(
+      new Request("https://clawsweeper-exact-review-queue/source-authority", {
+        method: "POST",
+        body: JSON.stringify({
+          delivery_id: deliveryId,
+          installation_id: 123,
+          decision: {
+            targetRepo: "openclaw/openclaw",
+            targetBranch: "main",
+            itemNumber: 749,
+            itemKind: "pull_request",
+            sourceEvent: "pull_request",
+            sourceAction: "synchronize",
+            supersedesInProgress: true,
+            sourceHeadSha: "a".repeat(40),
+            sourceUpdatedAt: "2026-07-23T13:00:02Z",
+          },
+        }),
+      }),
+    );
+
+  assert.deepEqual(await (await reserve(queue, "authority-delivery-1")).json(), {
+    ok: true,
+    source_authority_seq: 1,
+  });
+  assert.deepEqual(await (await reserve(queue, "authority-delivery-1")).json(), {
+    ok: true,
+    source_authority_seq: 1,
+  });
+  assert.deepEqual(await (await reserve(queue, "authority-delivery-2")).json(), {
+    ok: true,
+    source_authority_seq: 2,
+  });
+
+  const restarted = new ExactReviewQueue({ storage }, {});
+  assert.deepEqual(await (await reserve(restarted, "authority-delivery-3")).json(), {
+    ok: true,
+    source_authority_seq: 3,
+  });
+});
+
 test("automerge reliability summarizes failures, recovery, duration, and stalled runs", () => {
   const run = (
     id: number,
@@ -565,12 +610,14 @@ test("superseding source revisions revoke the old lease without Actions cancella
       itemKind: "pull_request" as const,
       sourceEvent: "pull_request" as const,
       sourceHeadSha: staleHeadSha,
+      sourceUpdatedAt: "2026-07-23T13:00:01Z",
     },
     leaseDecision: {
       ...staleBase.leaseDecision,
       itemKind: "pull_request" as const,
       sourceEvent: "pull_request" as const,
       sourceHeadSha: staleHeadSha,
+      sourceUpdatedAt: "2026-07-23T13:00:01Z",
       commandStatusMarker: "<!-- clawsweeper-command-status:753:re_review:old-head -->",
     },
   };
@@ -593,7 +640,12 @@ test("superseding source revisions revoke the old lease without Actions cancella
         "synchronize",
         "pull_request",
         "openclaw/openclaw",
-        { sourceHeadSha: currentHeadSha },
+        {
+          sourceHeadSha: currentHeadSha,
+          sourceHeadVerified: true,
+          sourceAuthoritySeq: 1,
+          sourceUpdatedAt: "2026-07-23T13:00:02Z",
+        },
       ),
     );
 
@@ -656,6 +708,325 @@ test("superseding source revisions revoke the old lease without Actions cancella
   } finally {
     Date.now = originalNow;
   }
+});
+
+test("source timestamp and sequence ordering protect a newer-head lease", async () => {
+  const storage = new MemoryDurableStorage();
+  const staleHeadSha = "a".repeat(40);
+  const currentHeadSha = "b".repeat(40);
+  const activeBase = leasedExactReviewQueueItem(756, "7560");
+  const active = {
+    ...activeBase,
+    decision: {
+      ...activeBase.decision,
+      itemKind: "pull_request" as const,
+      sourceEvent: "pull_request" as const,
+      sourceAction: "synchronize",
+      supersedesInProgress: true,
+      sourceHeadSha: currentHeadSha,
+      sourceHeadVerified: true,
+      sourceAuthoritySeq: 2,
+      sourceUpdatedAt: "2026-07-23T13:00:02Z",
+    },
+    leaseDecision: {
+      ...activeBase.leaseDecision,
+      itemKind: "pull_request" as const,
+      sourceEvent: "pull_request" as const,
+      sourceAction: "synchronize",
+      supersedesInProgress: true,
+      sourceHeadSha: currentHeadSha,
+      sourceHeadVerified: true,
+      sourceAuthoritySeq: 2,
+      sourceUpdatedAt: "2026-07-23T13:00:02Z",
+    },
+  };
+  await storage.put("exact-review-queue", {
+    deliveries: {},
+    items: { "openclaw/openclaw#756": active },
+  });
+  const queue = new ExactReviewQueue({ storage }, {});
+
+  const response = await queue.fetch(
+    buildExactReviewQueueRequest(
+      "delayed-stale-head-756",
+      756,
+      "synchronize",
+      "pull_request",
+      "openclaw/openclaw",
+      {
+        sourceHeadSha: staleHeadSha,
+        sourceHeadVerified: true,
+        sourceAuthoritySeq: 1,
+        sourceUpdatedAt: "2026-07-23T13:00:02Z",
+      },
+    ),
+  );
+
+  assert.equal(response.status, 202);
+  assert.deepEqual(await response.json(), {
+    ok: true,
+    deduped: true,
+    item_key: "openclaw/openclaw#756",
+    stale_source: true,
+  });
+  const olderSourceResponse = await queue.fetch(
+    buildExactReviewQueueRequest(
+      "later-reserved-older-head-756",
+      756,
+      "synchronize",
+      "pull_request",
+      "openclaw/openclaw",
+      {
+        sourceHeadSha: staleHeadSha,
+        sourceHeadVerified: true,
+        sourceAuthoritySeq: 3,
+        sourceUpdatedAt: "2026-07-23T13:00:01Z",
+      },
+    ),
+  );
+  assert.equal(olderSourceResponse.status, 202);
+  assert.equal((await olderSourceResponse.json()).stale_source, true);
+  const state = (await storage.get("exact-review-queue")) as {
+    items: Record<string, typeof active>;
+  };
+  const current = state.items["openclaw/openclaw#756"];
+  assert.equal(current.state, "leased");
+  assert.equal(current.revision, 1);
+  assert.equal(current.claimedRunId, "7560");
+  assert.equal(current.decision.sourceHeadSha, currentHeadSha);
+  assert.equal(current.leaseDecision.sourceHeadSha, currentHeadSha);
+  const stats = await (
+    await queue.fetch(new Request("https://clawsweeper-exact-review-queue/stats"))
+  ).json();
+  assert.equal(stats.lanes.review.superseded_total, 0);
+  assert.deepEqual(
+    Array.from(storage.sql.exec(`SELECT item_key FROM exact_review_queue_supersessions`)),
+    [],
+  );
+});
+
+test("delayed opened pull request delivery cannot replace a newer pending synchronize", async () => {
+  const storage = new MemoryDurableStorage();
+  const staleHeadSha = "a".repeat(40);
+  const currentHeadSha = "b".repeat(40);
+  const now = Date.now();
+  await storage.put("exact-review-queue", {
+    deliveries: {},
+    items: {
+      "openclaw/openclaw#757": {
+        key: "openclaw/openclaw#757",
+        decision: {
+          targetRepo: "openclaw/openclaw",
+          targetBranch: "main",
+          itemNumber: 757,
+          itemKind: "pull_request",
+          sourceEvent: "pull_request",
+          sourceAction: "synchronize",
+          supersedesInProgress: true,
+          sourceHeadSha: currentHeadSha,
+          sourceHeadVerified: true,
+          sourceAuthoritySeq: 2,
+          sourceUpdatedAt: "2026-07-23T13:00:02Z",
+        },
+        state: "pending",
+        revision: 1,
+        createdAt: now,
+        updatedAt: now,
+        nextAttemptAt: now + 90_000,
+        attempts: 0,
+      },
+    },
+  });
+  const queue = new ExactReviewQueue({ storage }, {});
+
+  const response = await queue.fetch(
+    buildExactReviewQueueRequest(
+      "delayed-opened-pending-head-757",
+      757,
+      "opened",
+      "pull_request",
+      "openclaw/openclaw",
+      {
+        sourceHeadSha: staleHeadSha,
+        sourceAuthoritySeq: 1,
+        sourceUpdatedAt: "2026-07-23T13:00:02Z",
+      },
+    ),
+  );
+
+  assert.equal(response.status, 202);
+  assert.equal((await response.json()).stale_source, true);
+  const state = (await storage.get("exact-review-queue")) as {
+    items: Record<string, { revision: number; decision: { sourceHeadSha?: string } }>;
+  };
+  assert.equal(state.items["openclaw/openclaw#757"].revision, 1);
+  assert.equal(state.items["openclaw/openclaw#757"].decision.sourceHeadSha, currentHeadSha);
+});
+
+test("same-timestamp verified successor replaces the current pull request head", async () => {
+  const storage = new MemoryDurableStorage();
+  const currentHeadSha = "b".repeat(40);
+  const successorHeadSha = "c".repeat(40);
+  const activeBase = leasedExactReviewQueueItem(7571, "75710");
+  const active = {
+    ...activeBase,
+    decision: {
+      ...activeBase.decision,
+      itemKind: "pull_request" as const,
+      sourceEvent: "pull_request" as const,
+      sourceAction: "synchronize",
+      supersedesInProgress: true,
+      sourceHeadSha: currentHeadSha,
+      sourceHeadVerified: true,
+      sourceAuthoritySeq: 2,
+      sourceUpdatedAt: "2026-07-23T13:00:02Z",
+    },
+    leaseDecision: {
+      ...activeBase.leaseDecision,
+      itemKind: "pull_request" as const,
+      sourceEvent: "pull_request" as const,
+      sourceAction: "synchronize",
+      supersedesInProgress: true,
+      sourceHeadSha: currentHeadSha,
+      sourceHeadVerified: true,
+      sourceAuthoritySeq: 2,
+      sourceUpdatedAt: "2026-07-23T13:00:02Z",
+    },
+  };
+  await storage.put("exact-review-queue", {
+    deliveries: {},
+    items: { "openclaw/openclaw#7571": active },
+  });
+  const queue = new ExactReviewQueue({ storage }, {});
+
+  const response = await queue.fetch(
+    buildExactReviewQueueRequest(
+      "same-timestamp-successor-7571",
+      7571,
+      "synchronize",
+      "pull_request",
+      "openclaw/openclaw",
+      {
+        sourceHeadSha: successorHeadSha,
+        sourceHeadVerified: true,
+        sourceAuthoritySeq: 3,
+        sourceUpdatedAt: "2026-07-23T13:00:02Z",
+      },
+    ),
+  );
+
+  assert.equal(response.status, 202);
+  assert.equal((await response.json()).queued, true);
+  const state = (await storage.get("exact-review-queue")) as {
+    items: Record<
+      string,
+      { state: string; revision: number; decision: { sourceHeadSha?: string } }
+    >;
+  };
+  assert.equal(state.items["openclaw/openclaw#7571"].state, "pending");
+  assert.equal(state.items["openclaw/openclaw#7571"].revision, 2);
+  assert.equal(state.items["openclaw/openclaw#7571"].decision.sourceHeadSha, successorHeadSha);
+});
+
+test("verified live head supersedes a timestamp-less rolling lease", async () => {
+  const originalNow = Date.now;
+  const storage = new MemoryDurableStorage();
+  const rolling = leasedExactReviewQueueItem(758, "7580");
+  rolling.decision.itemKind = "pull_request";
+  rolling.decision.sourceEvent = "pull_request";
+  rolling.leaseDecision.itemKind = "pull_request";
+  rolling.leaseDecision.sourceEvent = "pull_request";
+  await storage.put("exact-review-queue", {
+    deliveries: {},
+    items: { "openclaw/openclaw#758": rolling },
+  });
+  const queue = new ExactReviewQueue({ storage }, {});
+  const currentHeadSha = "c".repeat(40);
+  Date.now = () => rolling.updatedAt + 1_000;
+
+  try {
+    const heartbeat = await queue.fetch(
+      new Request("https://clawsweeper-exact-review-queue/heartbeat", {
+        method: "POST",
+        body: JSON.stringify({
+          item_key: "openclaw/openclaw#758",
+          lease_id: "lease-758",
+          lease_revision: 1,
+          claim_generation: 1,
+          run_id: "7580",
+          run_attempt: 1,
+        }),
+      }),
+    );
+    assert.equal(heartbeat.status, 200);
+    const response = await queue.fetch(
+      buildExactReviewQueueRequest(
+        "current-head-after-rolling-758",
+        758,
+        "synchronize",
+        "pull_request",
+        "openclaw/openclaw",
+        {
+          sourceHeadSha: currentHeadSha,
+          sourceHeadVerified: true,
+          sourceAuthoritySeq: 1,
+          sourceUpdatedAt: "2026-07-23T13:00:03Z",
+        },
+      ),
+    );
+
+    assert.equal(response.status, 202);
+    const state = (await storage.get("exact-review-queue")) as {
+      items: Record<
+        string,
+        { state: string; revision: number; decision: { sourceHeadSha?: string } }
+      >;
+    };
+    assert.equal(state.items["openclaw/openclaw#758"].state, "pending");
+    assert.equal(state.items["openclaw/openclaw#758"].revision, 2);
+    assert.equal(state.items["openclaw/openclaw#758"].decision.sourceHeadSha, currentHeadSha);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test("same-head edit supersedes a timestamp-less rolling decision", async () => {
+  const storage = new MemoryDurableStorage();
+  const currentHeadSha = "d".repeat(40);
+  const rolling = leasedExactReviewQueueItem(759, "7590");
+  rolling.decision.itemKind = "pull_request";
+  rolling.decision.sourceEvent = "pull_request";
+  rolling.decision.sourceHeadSha = currentHeadSha;
+  rolling.leaseDecision.itemKind = "pull_request";
+  rolling.leaseDecision.sourceEvent = "pull_request";
+  rolling.leaseDecision.sourceHeadSha = currentHeadSha;
+  await storage.put("exact-review-queue", {
+    deliveries: {},
+    items: { "openclaw/openclaw#759": rolling },
+  });
+  const queue = new ExactReviewQueue({ storage }, {});
+
+  const response = await queue.fetch(
+    buildExactReviewQueueRequest(
+      "same-head-edit-after-rolling-759",
+      759,
+      "edited",
+      "pull_request",
+      "openclaw/openclaw",
+      {
+        sourceHeadSha: currentHeadSha,
+        sourceAuthoritySeq: 1,
+      },
+    ),
+  );
+
+  assert.equal(response.status, 202);
+  const state = (await storage.get("exact-review-queue")) as {
+    items: Record<string, { state: string; revision: number; decision: { sourceAction: string } }>;
+  };
+  assert.equal(state.items["openclaw/openclaw#759"].state, "pending");
+  assert.equal(state.items["openclaw/openclaw#759"].revision, 2);
+  assert.equal(state.items["openclaw/openclaw#759"].decision.sourceAction, "edited");
 });
 
 test("exact-review heartbeat binds a claimed pull request source head", async () => {
@@ -11432,8 +11803,17 @@ test("hosted webhook rejects label additions before exact-review intake", async 
   }
 });
 
-test("hosted webhook enqueues item events with the repository default branch", async () => {
+test("hosted issue webhook enqueues without completing pull request authority", async () => {
   const queue = new ExactReviewQueue({ storage: new MemoryDurableStorage() }, {});
+  let authorityCompletionCalls = 0;
+  const queueStub = {
+    fetch(request: Request) {
+      if (new URL(request.url).pathname === "/source-authority/complete") {
+        authorityCompletionCalls += 1;
+      }
+      return queue.fetch(request);
+    },
+  };
   const response = await worker.fetch(
     signedGithubWebhookRequest({
       event: "issues",
@@ -11454,7 +11834,7 @@ test("hosted webhook enqueues item events with the repository default branch", a
     }),
     {
       CLAWSWEEPER_WEBHOOK_SECRET: "test-secret",
-      EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
+      EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queueStub),
     },
   );
 
@@ -11465,9 +11845,294 @@ test("hosted webhook enqueues item events with the repository default branch", a
     item_key: "openclaw/gogcli#597",
     superseded_publications: 0,
   });
+  assert.equal(authorityCompletionCalls, 0);
+});
+
+test("hosted synchronize webhook binds and enqueues only the live pull request head", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalNow = Date.now;
+  const now = 3_000_000;
+  Date.now = () => now;
+  const storage = new MemoryDurableStorage();
+  const queue = new ExactReviewQueue({ storage }, {});
+  const staleHeadSha = "a".repeat(40);
+  const sourceHeadSha = "b".repeat(40);
+  let verificationCalls = 0;
+  globalThis.fetch = async (input) => {
+    verificationCalls += 1;
+    assert.equal(String(input), "https://api.github.com/repos/openclaw/gogcli/pulls/596");
+    return new Response(JSON.stringify({ head: { sha: sourceHeadSha } }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  const send = (headSha: string, updatedAt: string, deliveryId: string) =>
+    worker.fetch(
+      signedGithubWebhookRequest({
+        event: "pull_request",
+        secret: "test-secret",
+        deliveryId,
+        payload: {
+          action: "synchronize",
+          repository: {
+            full_name: "openclaw/gogcli",
+            default_branch: "trunk",
+            private: false,
+            archived: false,
+            fork: false,
+            has_issues: true,
+          },
+          pull_request: {
+            number: 596,
+            head: { sha: headSha },
+            updated_at: updatedAt,
+          },
+          installation: { id: 123 },
+        },
+      }),
+      {
+        CLAWSWEEPER_WEBHOOK_SECRET: "test-secret",
+        GITHUB_TOKEN: "test-token",
+        EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
+      },
+    );
+
+  try {
+    const response = await send(sourceHeadSha, "2026-07-23T13:00:02Z", "synchronize-current-596");
+    assert.equal(response.status, 202);
+    const duplicateResponse = await send(
+      sourceHeadSha,
+      "2026-07-23T13:00:02Z",
+      "synchronize-current-596",
+    );
+    assert.deepEqual(await duplicateResponse.json(), {
+      ok: true,
+      deduped: true,
+      item_key: "openclaw/gogcli#596",
+    });
+    assert.equal(verificationCalls, 1);
+    const staleResponse = await send(staleHeadSha, "2026-07-23T13:00:01Z", "synchronize-stale-596");
+    assert.equal(staleResponse.status, 202);
+    assert.deepEqual(await staleResponse.json(), {
+      ok: true,
+      accepted: false,
+      reason: "stale pull request head",
+    });
+    assert.equal(verificationCalls, 2);
+    const staleDuplicateResponse = await send(
+      staleHeadSha,
+      "2026-07-23T13:00:01Z",
+      "synchronize-stale-596",
+    );
+    assert.deepEqual(await staleDuplicateResponse.json(), {
+      ok: true,
+      deduped: true,
+      item_key: "openclaw/gogcli#596",
+    });
+    assert.equal(verificationCalls, 2);
+    assert.equal(storage.rawGet("exact-review-source-authority-sequence:v1"), 2);
+    const stored = (await storage.get("exact-review-queue")) as {
+      items: Record<
+        string,
+        {
+          decision: {
+            sourceHeadSha?: string;
+            sourceHeadVerified?: boolean;
+            sourceAuthoritySeq?: number;
+            sourceUpdatedAt?: string;
+          };
+        }
+      >;
+    };
+    assert.deepEqual(stored.items["openclaw/gogcli#596"].decision, {
+      targetRepo: "openclaw/gogcli",
+      targetBranch: "trunk",
+      itemNumber: 596,
+      itemKind: "pull_request",
+      sourceEvent: "pull_request",
+      sourceAction: "synchronize",
+      supersedesInProgress: true,
+      sourceHeadSha,
+      sourceHeadVerified: true,
+      sourceAuthoritySeq: 1,
+      sourceUpdatedAt: "2026-07-23T13:00:02Z",
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    Date.now = originalNow;
+  }
+});
+
+test("hosted pull request verification survives a transient failure and queue restart", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalNow = Date.now;
+  let now = 3_500_000;
+  Date.now = () => now;
+  const storage = new MemoryDurableStorage();
+  const sourceHeadSha = "c".repeat(40);
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const queueEnv = {
+    CLAWSWEEPER_APP_CLIENT_ID: "Iv23test",
+    CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
+  };
+  const queue = new ExactReviewQueue({ storage }, queueEnv);
+  let verificationFailures = 2;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/repos/openclaw/gogcli/pulls/595") {
+      if (verificationFailures > 0) {
+        verificationFailures -= 1;
+        throw new Error("transient GitHub failure");
+      }
+      return jsonResponse({ head: { sha: sourceHeadSha } });
+    }
+    if (url.pathname === "/app/installations/123/access_tokens") {
+      return jsonResponse({ token: "target-token" });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(
+      signedGithubWebhookRequest({
+        event: "pull_request",
+        secret: "test-secret",
+        payload: {
+          action: "synchronize",
+          repository: {
+            full_name: "openclaw/gogcli",
+            default_branch: "trunk",
+            private: false,
+            archived: false,
+            fork: false,
+            has_issues: true,
+          },
+          pull_request: {
+            number: 595,
+            head: { sha: sourceHeadSha },
+            updated_at: "2026-07-23T13:00:02Z",
+          },
+          installation: { id: 123 },
+        },
+      }),
+      {
+        CLAWSWEEPER_WEBHOOK_SECRET: "test-secret",
+        GITHUB_TOKEN: "test-token",
+        EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
+      },
+    );
+    assert.equal(response.status, 202);
+    assert.deepEqual(await response.json(), {
+      ok: true,
+      accepted: true,
+      deferred: true,
+      reason: "pull request head verification deferred",
+    });
+    assert.equal(
+      storage.rawHas("exact-review-source-authority-reservation:v1:test-delivery"),
+      true,
+    );
+
+    const restarted = new ExactReviewQueue({ storage }, queueEnv);
+    await restarted.alarm();
+    const deferred = storage.rawGet(
+      "exact-review-source-authority-reservation:v1:test-delivery",
+    ) as {
+      attempts: number;
+      nextAttemptAt: number;
+      sourceAuthoritySeq: number;
+    };
+    assert.equal(deferred.attempts, 1);
+    assert.equal(deferred.sourceAuthoritySeq, 1);
+    assert.equal(deferred.nextAttemptAt, now + 15_000);
+    assert.equal(await storage.getAlarm(), deferred.nextAttemptAt);
+
+    now = deferred.nextAttemptAt;
+    await restarted.alarm();
+    const stored = (await storage.get("exact-review-queue")) as {
+      items: Record<string, { decision: { sourceHeadSha?: string; sourceHeadVerified?: boolean } }>;
+    };
+    assert.equal(stored.items["openclaw/gogcli#595"].decision.sourceHeadSha, sourceHeadSha);
+    assert.equal(stored.items["openclaw/gogcli#595"].decision.sourceHeadVerified, true);
+    assert.equal(
+      storage.rawHas("exact-review-source-authority-reservation:v1:test-delivery"),
+      false,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    Date.now = originalNow;
+  }
+});
+
+test("hosted reopened webhook advances to its verified current head", async () => {
+  const originalFetch = globalThis.fetch;
+  const storage = new MemoryDurableStorage();
+  const previousHeadSha = "d".repeat(40);
+  const sourceHeadSha = "e".repeat(40);
+  const existing = leasedExactReviewQueueItem(594, "5940");
+  existing.decision.itemKind = "pull_request";
+  existing.decision.sourceEvent = "pull_request";
+  existing.decision.sourceHeadSha = previousHeadSha;
+  existing.leaseDecision.itemKind = "pull_request";
+  existing.leaseDecision.sourceEvent = "pull_request";
+  existing.leaseDecision.sourceHeadSha = previousHeadSha;
+  await storage.put("exact-review-queue", {
+    deliveries: {},
+    items: { "openclaw/gogcli#594": existing },
+  });
+  const queue = new ExactReviewQueue({ storage }, {});
+  globalThis.fetch = async (input) => {
+    assert.equal(String(input), "https://api.github.com/repos/openclaw/gogcli/pulls/594");
+    return jsonResponse({ head: { sha: sourceHeadSha } });
+  };
+
+  try {
+    const response = await worker.fetch(
+      signedGithubWebhookRequest({
+        event: "pull_request",
+        secret: "test-secret",
+        payload: {
+          action: "reopened",
+          repository: {
+            full_name: "openclaw/gogcli",
+            default_branch: "trunk",
+            private: false,
+            archived: false,
+            fork: false,
+            has_issues: true,
+          },
+          pull_request: {
+            number: 594,
+            head: { sha: sourceHeadSha },
+            updated_at: "2026-07-23T13:00:03Z",
+          },
+          installation: { id: 123 },
+        },
+      }),
+      {
+        CLAWSWEEPER_WEBHOOK_SECRET: "test-secret",
+        GITHUB_TOKEN: "test-token",
+        EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
+      },
+    );
+    assert.equal(response.status, 202);
+    const stored = (await storage.get("exact-review-queue")) as {
+      items: Record<string, { decision: { sourceAction: string; sourceHeadSha?: string } }>;
+    };
+    assert.equal(stored.items["openclaw/gogcli#594"].decision.sourceAction, "reopened");
+    assert.equal(stored.items["openclaw/gogcli#594"].decision.sourceHeadSha, sourceHeadSha);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("hosted webhook requeues unlocked and close-guard removal events", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => jsonResponse({ head: { sha: "e".repeat(40) } });
   const closeGuardLabels = [
     "security",
     "beta-blocker",
@@ -11486,60 +12151,69 @@ test("hosted webhook requeues unlocked and close-guard removal events", async ()
       { event: "pull_request", action: "unlabeled", label: { name } },
     ]),
   ];
-  for (const [index, { event, action, label }] of cases.entries()) {
-    const number = 598 + index;
-    const storage = new MemoryDurableStorage();
-    const queue = new ExactReviewQueue({ storage }, {});
-    const response = await worker.fetch(
-      signedGithubWebhookRequest({
-        event,
-        secret: "test-secret",
-        payload: {
-          action,
-          repository: {
-            full_name: "openclaw/gogcli",
-            default_branch: "trunk",
-            private: false,
-            archived: false,
-            fork: false,
-            has_issues: true,
+  try {
+    for (const [index, { event, action, label }] of cases.entries()) {
+      const number = 598 + index;
+      const storage = new MemoryDurableStorage();
+      const queue = new ExactReviewQueue({ storage }, {});
+      const response = await worker.fetch(
+        signedGithubWebhookRequest({
+          event,
+          secret: "test-secret",
+          payload: {
+            action,
+            repository: {
+              full_name: "openclaw/gogcli",
+              default_branch: "trunk",
+              private: false,
+              archived: false,
+              fork: false,
+              has_issues: true,
+            },
+            ...(event === "issues"
+              ? { issue: { number } }
+              : { pull_request: { number, head: { sha: "e".repeat(40) } } }),
+            ...(label ? { label } : {}),
+            installation: { id: 123 },
           },
-          ...(event === "issues"
-            ? { issue: { number } }
-            : { pull_request: { number, head: { sha: "e".repeat(40) } } }),
-          ...(label ? { label } : {}),
-          installation: { id: 123 },
-        },
-      }),
-      {
-        CLAWSWEEPER_WEBHOOK_SECRET: "test-secret",
-        EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
-      },
-    );
-
-    assert.equal(response.status, 202);
-    assert.deepEqual(await response.json(), {
-      ok: true,
-      queued: true,
-      item_key: `openclaw/gogcli#${number}`,
-      superseded_publications: 0,
-    });
-    const stored = (await storage.get("exact-review-queue")) as {
-      items: Record<
-        string,
+        }),
         {
-          decision: { sourceAction: string; supersedesInProgress: boolean; sourceHeadSha?: string };
-        }
-      >;
-    };
-    assert.equal(stored.items[`openclaw/gogcli#${number}`].decision.sourceAction, action);
-    assert.equal(stored.items[`openclaw/gogcli#${number}`].decision.supersedesInProgress, true);
-    if (event === "pull_request") {
-      assert.equal(
-        stored.items[`openclaw/gogcli#${number}`].decision.sourceHeadSha,
-        "e".repeat(40),
+          CLAWSWEEPER_WEBHOOK_SECRET: "test-secret",
+          GITHUB_TOKEN: "test-token",
+          EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
+        },
       );
+
+      assert.equal(response.status, 202);
+      assert.deepEqual(await response.json(), {
+        ok: true,
+        queued: true,
+        item_key: `openclaw/gogcli#${number}`,
+        superseded_publications: 0,
+      });
+      const stored = (await storage.get("exact-review-queue")) as {
+        items: Record<
+          string,
+          {
+            decision: {
+              sourceAction: string;
+              supersedesInProgress: boolean;
+              sourceHeadSha?: string;
+            };
+          }
+        >;
+      };
+      assert.equal(stored.items[`openclaw/gogcli#${number}`].decision.sourceAction, action);
+      assert.equal(stored.items[`openclaw/gogcli#${number}`].decision.supersedesInProgress, true);
+      if (event === "pull_request") {
+        assert.equal(
+          stored.items[`openclaw/gogcli#${number}`].decision.sourceHeadSha,
+          "e".repeat(40),
+        );
+      }
     }
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });
 
@@ -12192,23 +12866,27 @@ function signedGithubWebhookRequest({
   event,
   secret,
   payload,
+  deliveryId = "test-delivery",
 }: {
   event: string;
   secret: string;
   payload: unknown;
+  deliveryId?: string;
 }) {
   const body = JSON.stringify(payload);
-  return signedGithubWebhookBodyRequest({ event, secret, body });
+  return signedGithubWebhookBodyRequest({ event, secret, body, deliveryId });
 }
 
 function signedGithubWebhookBodyRequest({
   event,
   secret,
   body,
+  deliveryId = "test-delivery",
 }: {
   event: string;
   secret: string;
   body: string;
+  deliveryId?: string;
 }) {
   const signature = `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
   return new Request("https://clawsweeper.openclaw.ai/github/webhook", {
@@ -12216,7 +12894,7 @@ function signedGithubWebhookBodyRequest({
     headers: {
       "content-type": "application/json",
       "x-github-event": event,
-      "x-github-delivery": "test-delivery",
+      "x-github-delivery": deliveryId,
       "x-hub-signature-256": signature,
     },
     body,
