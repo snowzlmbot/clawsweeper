@@ -554,6 +554,8 @@ test("superseding source revisions revoke the old lease and cancel its Actions r
   const now = 3_000_000;
   Date.now = () => now;
   const storage = new MemoryDurableStorage();
+  const staleHeadSha = "a".repeat(40);
+  const currentHeadSha = "b".repeat(40);
   const staleBase = leasedExactReviewQueueItem(753, "7530");
   const stale = {
     ...staleBase,
@@ -563,11 +565,13 @@ test("superseding source revisions revoke the old lease and cancel its Actions r
       ...staleBase.decision,
       itemKind: "pull_request" as const,
       sourceEvent: "pull_request" as const,
+      sourceHeadSha: staleHeadSha,
     },
     leaseDecision: {
       ...staleBase.leaseDecision,
       itemKind: "pull_request" as const,
       sourceEvent: "pull_request" as const,
+      sourceHeadSha: staleHeadSha,
       commandStatusMarker: "<!-- clawsweeper-command-status:753:re_review:old-head -->",
     },
   };
@@ -581,15 +585,28 @@ test("superseding source revisions revoke the old lease and cancel its Actions r
     publicKeyEncoding: { type: "spki", format: "pem" },
   });
   const cancelled: string[] = [];
-  let requestedPermissions: Record<string, string> | null = null;
+  const requestedPermissions: Array<Record<string, string>> = [];
   globalThis.fetch = async (input, init) => {
     const url = new URL(String(input));
     if (url.pathname === "/repos/openclaw/clawsweeper/installation") {
       return jsonResponse({ id: 999 });
     }
     if (url.pathname === "/app/installations/999/access_tokens") {
-      requestedPermissions = JSON.parse(String(init?.body)).permissions;
-      return jsonResponse({ token: "actions-write-token" });
+      requestedPermissions.push(JSON.parse(String(init?.body)).permissions);
+      return jsonResponse({ token: `actions-token-${requestedPermissions.length}` });
+    }
+    if (
+      url.pathname === "/repos/openclaw/clawsweeper/actions/runs/7530" &&
+      init?.method === "GET"
+    ) {
+      return jsonResponse({
+        id: 7530,
+        path: ".github/workflows/sweep.yml",
+        event: "repository_dispatch",
+        display_title: `Review exact item openclaw/openclaw#753 rev 1 head ${staleHeadSha}`,
+        run_attempt: 1,
+        repository: { full_name: "openclaw/clawsweeper" },
+      });
     }
     if (url.pathname === "/repos/openclaw/clawsweeper/actions/runs/7530/cancel") {
       assert.ok((await storage.getAlarm()) !== null);
@@ -616,12 +633,13 @@ test("superseding source revisions revoke the old lease and cancel its Actions r
         "synchronize",
         "pull_request",
         "openclaw/openclaw",
+        { sourceHeadSha: currentHeadSha },
       ),
     );
 
     assert.equal(response.status, 202);
     assert.deepEqual(cancelled, ["/repos/openclaw/clawsweeper/actions/runs/7530/cancel"]);
-    assert.deepEqual(requestedPermissions, { actions: "write" });
+    assert.deepEqual(requestedPermissions, [{ actions: "read" }, { actions: "write" }]);
     const state = (await storage.get("exact-review-queue")) as {
       items: Record<string, Record<string, unknown>>;
     };
@@ -680,6 +698,93 @@ test("superseding source revisions revoke the old lease and cancel its Actions r
   } finally {
     globalThis.fetch = originalFetch;
     Date.now = originalNow;
+  }
+});
+
+test("superseding source revisions never cancel an unrelated Actions run id", async () => {
+  const originalFetch = globalThis.fetch;
+  const storage = new MemoryDurableStorage();
+  const staleHeadSha = "c".repeat(40);
+  const staleBase = leasedExactReviewQueueItem(755, "7550");
+  const stale = {
+    ...staleBase,
+    decision: {
+      ...staleBase.decision,
+      itemKind: "pull_request" as const,
+      sourceEvent: "pull_request" as const,
+      sourceHeadSha: staleHeadSha,
+    },
+    leaseDecision: {
+      ...staleBase.leaseDecision,
+      itemKind: "pull_request" as const,
+      sourceEvent: "pull_request" as const,
+      sourceHeadSha: staleHeadSha,
+    },
+  };
+  await storage.put("exact-review-queue", {
+    deliveries: {},
+    items: { "openclaw/openclaw#755": stale },
+  });
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const cancelled: string[] = [];
+  const requestedPermissions: Array<Record<string, string>> = [];
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/repos/openclaw/clawsweeper/installation") {
+      return jsonResponse({ id: 999 });
+    }
+    if (url.pathname === "/app/installations/999/access_tokens") {
+      requestedPermissions.push(JSON.parse(String(init?.body)).permissions);
+      return jsonResponse({ token: "actions-read-token" });
+    }
+    if (
+      url.pathname === "/repos/openclaw/clawsweeper/actions/runs/7550" &&
+      init?.method === "GET"
+    ) {
+      return jsonResponse({
+        id: 7550,
+        path: ".github/workflows/other.yml",
+        event: "workflow_dispatch",
+        display_title: "Unrelated workflow",
+        run_attempt: 1,
+        repository: { full_name: "openclaw/clawsweeper" },
+      });
+    }
+    if (url.pathname.endsWith("/actions/runs/7550/cancel")) {
+      cancelled.push(url.pathname);
+      return new Response(null, { status: 202 });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  try {
+    const queue = new ExactReviewQueue(
+      { storage },
+      {
+        CLAWSWEEPER_APP_CLIENT_ID: "Iv23test",
+        CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
+      },
+    );
+    const response = await queue.fetch(
+      buildExactReviewQueueRequest(
+        "superseding-unrelated-run-755",
+        755,
+        "synchronize",
+        "pull_request",
+        "openclaw/openclaw",
+        { sourceHeadSha: "d".repeat(40) },
+      ),
+    );
+
+    assert.equal(response.status, 202);
+    assert.deepEqual(cancelled, []);
+    assert.deepEqual(requestedPermissions, [{ actions: "read" }]);
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });
 
@@ -865,7 +970,9 @@ test("exact-review heartbeat refreshes only the matching live lease tuple", asyn
     item_key: "openclaw/openclaw#700",
     lease_id: "lease-700",
     lease_revision: 1,
+    claim_generation: 1,
     run_id: "7000",
+    run_attempt: 1,
   });
   const response = await worker.fetch(
     new Request("https://clawsweeper.openclaw.ai/internal/exact-review/heartbeat", {
@@ -888,8 +995,10 @@ test("exact-review heartbeat refreshes only the matching live lease tuple", asyn
   const mismatchBody = JSON.stringify({
     item_key: "openclaw/openclaw#700",
     lease_id: "lease-700",
-    lease_revision: 2,
+    lease_revision: 1,
+    claim_generation: 2,
     run_id: "7000",
+    run_attempt: 1,
   });
   const mismatch = await worker.fetch(
     new Request("https://clawsweeper.openclaw.ai/internal/exact-review/heartbeat", {
@@ -11480,7 +11589,9 @@ test("hosted webhook requeues unlocked and close-guard removal events", async ()
             fork: false,
             has_issues: true,
           },
-          ...(event === "issues" ? { issue: { number } } : { pull_request: { number } }),
+          ...(event === "issues"
+            ? { issue: { number } }
+            : { pull_request: { number, head: { sha: "e".repeat(40) } } }),
           ...(label ? { label } : {}),
           installation: { id: 123 },
         },
@@ -11499,10 +11610,21 @@ test("hosted webhook requeues unlocked and close-guard removal events", async ()
       superseded_publications: 0,
     });
     const stored = (await storage.get("exact-review-queue")) as {
-      items: Record<string, { decision: { sourceAction: string; supersedesInProgress: boolean } }>;
+      items: Record<
+        string,
+        {
+          decision: { sourceAction: string; supersedesInProgress: boolean; sourceHeadSha?: string };
+        }
+      >;
     };
     assert.equal(stored.items[`openclaw/gogcli#${number}`].decision.sourceAction, action);
     assert.equal(stored.items[`openclaw/gogcli#${number}`].decision.supersedesInProgress, true);
+    if (event === "pull_request") {
+      assert.equal(
+        stored.items[`openclaw/gogcli#${number}`].decision.sourceHeadSha,
+        "e".repeat(40),
+      );
+    }
   }
 });
 

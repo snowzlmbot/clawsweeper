@@ -228,6 +228,139 @@ if (args[0] === "api" && path === "repos/openclaw/openclaw/issues/357") {
   }
 });
 
+test("reserve-review-lease stale A preserves newer-head lease B", () => {
+  const root = mkdtempSync(join(tmpdir(), "cmd-reserve-lease-race-"));
+  const binDir = join(root, "bin");
+  const ghPath = join(binDir, "gh.js");
+  const curlPath = join(binDir, "curl");
+  const postedPath = join(root, "posted.json");
+  const pullCountPath = join(root, "pull-count.txt");
+  const deleteLogPath = join(root, "deletes.log");
+  const curlLogPath = join(root, "curl.log");
+  const staleHead = "a".repeat(40);
+  const newerHead = "b".repeat(40);
+  try {
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(
+      ghPath,
+      `
+const { appendFileSync, existsSync, readFileSync, writeFileSync } = require("node:fs");
+const postedPath = ${JSON.stringify(postedPath)};
+const pullCountPath = ${JSON.stringify(pullCountPath)};
+const deleteLogPath = ${JSON.stringify(deleteLogPath)};
+const staleHead = ${JSON.stringify(staleHead)};
+const newerHead = ${JSON.stringify(newerHead)};
+const args = process.argv.slice(2);
+const path = args[1] || "";
+const newerLease = {
+  id: 9992,
+  html_url: "https://github.com/openclaw/openclaw/pull/357#issuecomment-9992",
+  created_at: "2026-07-23T13:00:02Z",
+  updated_at: "2026-07-23T13:00:02Z",
+  user: { login: "clawsweeper[bot]" },
+  body: [
+    "ClawSweeper status: review started.",
+    \`<!-- clawsweeper-review-status:started item=357 sha=\${newerHead} started_at=2026-07-23T13:00:02.000Z lease_expires_at=2026-07-23T14:00:02.000Z owner=github-run-222-1 v=1 -->\`,
+    "<!-- clawsweeper-review-lease item=357 -->",
+  ].join("\\n"),
+};
+const comments = () => existsSync(postedPath)
+  ? [JSON.parse(readFileSync(postedPath, "utf8")), newerLease]
+  : [];
+if (args[0] === "api" && path === "repos/openclaw/openclaw/issues/357") {
+  console.log(JSON.stringify({
+    number: 357,
+    title: "Fence stale review cleanup",
+    html_url: "https://github.com/openclaw/openclaw/pull/357",
+    created_at: "2026-07-23T12:00:00Z",
+    updated_at: "2026-07-23T13:00:00Z",
+    closed_at: null,
+    state: "open",
+    locked: false,
+    active_lock_reason: null,
+    author_association: "CONTRIBUTOR",
+    user: { login: "reporter" },
+    labels: [],
+    pull_request: {}
+  }));
+} else if (args[0] === "api" && path === "repos/openclaw/openclaw/pulls/357") {
+  const count = existsSync(pullCountPath) ? Number(readFileSync(pullCountPath, "utf8")) : 0;
+  writeFileSync(pullCountPath, String(count + 1));
+  console.log(JSON.stringify({ head: { sha: count === 0 ? staleHead : newerHead } }));
+} else if (args[0] === "api" && path.startsWith("repos/openclaw/openclaw/issues/357/comments") && !args.includes("--method")) {
+  const value = comments();
+  console.log(JSON.stringify(args.includes("--slurp") ? [value] : value));
+} else if (args[0] === "api" && path === "repos/openclaw/openclaw/issues/357/comments" && args.includes("POST")) {
+  const body = JSON.parse(readFileSync(args[args.indexOf("--input") + 1], "utf8")).body;
+  const lease = {
+    id: 9991,
+    html_url: "https://github.com/openclaw/openclaw/pull/357#issuecomment-9991",
+    created_at: "2026-07-23T13:00:01Z",
+    updated_at: "2026-07-23T13:00:01Z",
+    user: { login: "clawsweeper[bot]" },
+    body
+  };
+  writeFileSync(postedPath, JSON.stringify(lease));
+  console.log(JSON.stringify(lease));
+} else if (args[0] === "api" && /repos\\/openclaw\\/openclaw\\/issues\\/comments\\/\\d+$/.test(path) && args.includes("DELETE")) {
+  appendFileSync(deleteLogPath, path + "\\n");
+  console.log("");
+} else {
+  console.error("unexpected gh args", JSON.stringify(args));
+  process.exit(1);
+}
+`,
+      "utf8",
+    );
+    writeFileSync(
+      curlPath,
+      `#!/usr/bin/env node
+require("node:fs").appendFileSync(${JSON.stringify(curlLogPath)}, process.argv.slice(2).join(" ") + "\\n");
+process.stdout.write("200");
+`,
+      "utf8",
+    );
+    chmodSync(curlPath, 0o755);
+
+    const result = spawnSync(
+      process.execPath,
+      [
+        CLI,
+        "reserve-review-lease",
+        "--target-repo",
+        "openclaw/openclaw",
+        "--item-number",
+        "357",
+        "--review-timeout-ms",
+        "600000",
+      ],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          ...mockGhBinEnv(ghPath, binDir),
+          GITHUB_RUN_ID: "111",
+          GITHUB_RUN_ATTEMPT: "1",
+          EXACT_REVIEW_QUEUE_URL: "https://queue.example.invalid",
+          EXACT_REVIEW_ITEM_KEY: "openclaw/openclaw#357",
+          EXACT_REVIEW_LEASE_ID: "lease-357",
+          EXACT_REVIEW_LEASE_REVISION: "1",
+          EXACT_REVIEW_CLAIM_GENERATION: "1",
+        },
+      },
+    );
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /review revision changed while reserving #357/);
+    assert.deepEqual(readFileSync(deleteLogPath, "utf8").trim().split("\n"), [
+      "repos/openclaw/openclaw/issues/comments/9991",
+    ]);
+    assert.equal(existsSync(curlLogPath), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("managed local review checkout fetches the pull request ref", () => {
   const root = mkdtempSync(join(tmpdir(), "cmd-"));
   const origin = join(root, "origin.git");

@@ -56,6 +56,7 @@ export type ExactReviewBaseDecision = {
   sourceEvent: "issues" | "pull_request";
   sourceAction: string;
   supersedesInProgress: boolean;
+  sourceHeadSha?: string;
   codexTimeoutMs?: number;
   mediaProofTimeoutMs?: number;
   commandStatusMarker?: string;
@@ -164,6 +165,13 @@ export type ExactReviewClaimedRun = {
   runId: string;
   runAttempt?: number;
   claimGeneration: number;
+};
+type ExactReviewRunIdentity = {
+  runId: string;
+  runAttempt?: number;
+  itemKey: string;
+  leaseRevision: number;
+  sourceHeadSha: string | null;
 };
 export type ExactReviewQueueState = {
   items: Record<string, ExactReviewQueueItem>;
@@ -830,6 +838,7 @@ export class ExactReviewQueue {
         const key = exactReviewItemKey(decision);
         const current = state.items[key];
         let supersededRunId: string | null = null;
+        let supersededRun: ExactReviewRunIdentity | null = null;
         let supersessionAudit: ExactReviewSupersessionAudit | null = null;
         if (current) {
           const ignoredRecovery = isLowPriorityExactReviewDecision(decision);
@@ -846,6 +855,7 @@ export class ExactReviewQueue {
             if (supersedesActiveReview) {
               const priorRevision = current.revision;
               supersededRunId = current.claimedRunId || null;
+              supersededRun = exactReviewRunIdentity(current);
               supersessionAudit = {
                 itemKey: key,
                 priorRevision,
@@ -927,6 +937,7 @@ export class ExactReviewQueue {
           state,
           supersededPublications,
           supersededRunId,
+          supersededRun,
         };
       });
       if (accepted.deduped) {
@@ -960,8 +971,8 @@ export class ExactReviewQueue {
         return json({ ok: true, shed: true, reason: "backpressure" }, 202);
       }
       await this.scheduleNext(accepted.state, now);
-      if (accepted.supersededRunId) {
-        await cancelSupersededExactReviewRun(this.env, accepted.supersededRunId);
+      if (accepted.supersededRun) {
+        await cancelSupersededExactReviewRun(this.env, accepted.supersededRun);
       }
       return json(
         {
@@ -1097,11 +1108,19 @@ export class ExactReviewQueue {
       const leaseId = String(body.lease_id || "").trim();
       const leaseRevision = Number(body.lease_revision);
       const runId = String(body.run_id || "").trim();
+      const hasRunAttempt = body.run_attempt !== undefined;
+      const runAttempt = hasRunAttempt ? exactReviewRunAttempt(body.run_attempt) : null;
+      const hasClaimGeneration = body.claim_generation !== undefined;
+      const claimGeneration = hasClaimGeneration ? Number(body.claim_generation) : null;
       if (!itemKey || !leaseId || !runId) return json({ error: "missing_lease_tuple" }, 400);
       if (!Number.isInteger(leaseRevision) || leaseRevision < 1) {
         return json({ error: "invalid_lease_revision" }, 400);
       }
       if (!/^\d+$/.test(runId)) return json({ error: "invalid_run_id" }, 400);
+      if (hasRunAttempt && runAttempt === null) return json({ error: "invalid_run_attempt" }, 400);
+      if (hasClaimGeneration && (!Number.isInteger(claimGeneration) || claimGeneration < 1)) {
+        return json({ error: "invalid_claim_generation" }, 400);
+      }
 
       const now = Date.now();
       const state = this.readStateSync();
@@ -1127,6 +1146,9 @@ export class ExactReviewQueue {
         item.leaseId !== leaseId ||
         item.leaseRevision !== leaseRevision ||
         item.claimedRunId !== runId ||
+        (hasRunAttempt && item.claimedRunAttempt !== runAttempt) ||
+        (hasClaimGeneration &&
+          exactReviewClaimGeneration(item.claimGeneration) !== claimGeneration) ||
         !isLiveExactReviewLease(
           item,
           now,
@@ -5160,6 +5182,12 @@ function exactReviewBaseDecisionFrom(value): ExactReviewBaseDecision | null {
   const itemKind = String(decision.itemKind || "");
   const sourceEvent = String(decision.sourceEvent || "");
   const sourceAction = String(decision.sourceAction || "");
+  const hasSourceHeadSha = Object.hasOwn(decision, "sourceHeadSha");
+  const sourceHeadSha = hasSourceHeadSha
+    ? String(decision.sourceHeadSha || "")
+        .trim()
+        .toLowerCase()
+    : undefined;
   const hasCommandStatusMarker = Object.hasOwn(decision, "commandStatusMarker");
   const commandStatusMarker = hasCommandStatusMarker ? decision.commandStatusMarker : undefined;
   const hasStatusCommentId = Object.hasOwn(decision, "statusCommentId");
@@ -5172,6 +5200,7 @@ function exactReviewBaseDecisionFrom(value): ExactReviewBaseDecision | null {
   if (itemKind !== "issue" && itemKind !== "pull_request") return null;
   if (sourceEvent !== "issues" && sourceEvent !== "pull_request") return null;
   if (!sourceAction) return null;
+  if (hasSourceHeadSha && !/^[0-9a-f]{40}$/.test(sourceHeadSha || "")) return null;
   if (
     hasCommandStatusMarker &&
     (typeof commandStatusMarker !== "string" ||
@@ -5201,6 +5230,7 @@ function exactReviewBaseDecisionFrom(value): ExactReviewBaseDecision | null {
     sourceEvent,
     sourceAction,
     supersedesInProgress: Boolean(decision.supersedesInProgress),
+    ...(hasSourceHeadSha ? { sourceHeadSha } : {}),
     ...(Number.isFinite(Number(decision.codexTimeoutMs))
       ? { codexTimeoutMs: Number(decision.codexTimeoutMs) }
       : {}),
@@ -5336,6 +5366,39 @@ function exactReviewItemKey(decision: ExactReviewDecision) {
   return decision.publication
     ? `${base}@publish:${decision.publication.producerRunId}:${decision.publication.producerRunAttempt}`
     : base;
+}
+
+function exactReviewRunIdentity(item: ExactReviewQueueItem): ExactReviewRunIdentity | null {
+  const runId = String(item.claimedRunId || "").trim();
+  const leaseRevision = Number(item.leaseRevision);
+  const decision = item.leaseDecision;
+  if (
+    !/^\d{1,30}$/.test(runId) ||
+    !Number.isSafeInteger(leaseRevision) ||
+    leaseRevision < 1 ||
+    !decision
+  ) {
+    return null;
+  }
+  const sourceHeadSha = String(decision.sourceHeadSha || "")
+    .trim()
+    .toLowerCase();
+  if (decision.itemKind === "pull_request" && !/^[0-9a-f]{40}$/.test(sourceHeadSha)) {
+    return null;
+  }
+  return {
+    runId,
+    ...(item.claimedRunAttempt ? { runAttempt: item.claimedRunAttempt } : {}),
+    itemKey: item.key,
+    leaseRevision,
+    sourceHeadSha: sourceHeadSha || null,
+  };
+}
+
+function exactReviewRunTitle(
+  identity: Pick<ExactReviewRunIdentity, "itemKey" | "leaseRevision" | "sourceHeadSha">,
+) {
+  return `Review exact item ${identity.itemKey} rev ${identity.leaseRevision} head ${identity.sourceHeadSha || "na"}`;
 }
 
 function isExactReviewQueueTargetEnabled(decision: ExactReviewDecision, env) {
@@ -7481,12 +7544,43 @@ async function exactReviewActionsWriteToken(env) {
   return exactReviewRepositoryToken(env, { actions: "write" });
 }
 
-async function cancelSupersededExactReviewRun(env, runId: string) {
+function exactReviewRunMatchesIdentity(
+  run: Record<string, unknown>,
+  identity: ExactReviewRunIdentity,
+): boolean {
+  const repository = objectValue(run.repository);
+  const workflowPath = String(run.path || "").replace(/^\/+/, "");
+  const runAttempt = exactReviewRunAttempt(run.run_attempt);
+  return (
+    String(run.id || "") === identity.runId &&
+    String(repository.full_name || "").toLowerCase() === CLAWSWEEPER_REVIEW_REPO &&
+    workflowPath === ".github/workflows/sweep.yml" &&
+    String(run.event || "") === "repository_dispatch" &&
+    String(run.display_title || "") === exactReviewRunTitle(identity) &&
+    (!identity.runAttempt || runAttempt === identity.runAttempt)
+  );
+}
+
+async function cancelSupersededExactReviewRun(env, identity: ExactReviewRunIdentity) {
   try {
-    const token = await exactReviewActionsWriteToken(env);
+    const readToken = await exactReviewActionsReadToken(env);
+    const run = await githubTokenJson({
+      token: readToken,
+      path: `/repos/${CLAWSWEEPER_REVIEW_REPO}/actions/runs/${identity.runId}`,
+      method: "GET",
+      body: undefined,
+      errorLabel: "Superseded ClawSweeper run identity",
+    });
+    if (!exactReviewRunMatchesIdentity(run, identity)) {
+      console.warn(
+        `refusing to cancel superseded exact-review run ${identity.runId}: run identity mismatch`,
+      );
+      return;
+    }
+    const writeToken = await exactReviewActionsWriteToken(env);
     await githubTokenJson({
-      token,
-      path: `/repos/${CLAWSWEEPER_REVIEW_REPO}/actions/runs/${runId}/cancel`,
+      token: writeToken,
+      path: `/repos/${CLAWSWEEPER_REVIEW_REPO}/actions/runs/${identity.runId}/cancel`,
       method: "POST",
       body: undefined,
       errorLabel: "Superseded ClawSweeper run cancellation",
@@ -7495,7 +7589,7 @@ async function cancelSupersededExactReviewRun(env, runId: string) {
     // The queue revision remains authoritative when the best-effort API
     // cancellation races a terminal run or GitHub is unavailable.
     console.warn(
-      `superseded exact-review run ${runId} could not be cancelled`,
+      `superseded exact-review run ${identity.runId} could not be cancelled`,
       error instanceof Error ? error.message : String(error),
     );
   }
@@ -7703,6 +7797,7 @@ async function dispatchClawsweeperItem({
         source_event: decision.sourceEvent,
         source_action: decision.sourceAction,
         supersedes_in_progress: decision.supersedesInProgress,
+        ...(decision.sourceHeadSha ? { source_head_sha: decision.sourceHeadSha } : {}),
         ...(Object.keys(reviewOptions).length > 0 ? { review_options: reviewOptions } : {}),
       },
     },

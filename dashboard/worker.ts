@@ -1261,10 +1261,14 @@ function classifyGithubItemWebhook({ event, payload }) {
     if (action === "unlabeled" && !isCloseGuardLabel(payload.label)) {
       return { accepted: false, reason: "unsupported action" };
     }
-    const itemNumber = Number(objectValue(payload.pull_request).number);
+    const pullRequest = objectValue(payload.pull_request);
+    const itemNumber = Number(pullRequest.number);
     if (!Number.isInteger(itemNumber) || itemNumber <= 0) {
       return { accepted: false, reason: "missing pull request number" };
     }
+    const sourceHeadSha = String(objectValue(pullRequest.head).sha || "")
+      .trim()
+      .toLowerCase();
     return {
       accepted: true,
       type: "item",
@@ -1275,6 +1279,7 @@ function classifyGithubItemWebhook({ event, payload }) {
       installationId,
       sourceEvent: "pull_request",
       sourceAction: action,
+      ...(/^[0-9a-f]{40}$/.test(sourceHeadSha) ? { sourceHeadSha } : {}),
       supersedesInProgress: [
         "edited",
         "synchronize",
