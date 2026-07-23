@@ -12,17 +12,34 @@ on:
       - "results/**"
   pull_request:
   workflow_dispatch:
+    inputs:
+      item_key:
+        description: "Isolated exact-review item key"
+        required: true
+        type: string
+      revision:
+        description: "Proof revision label"
+        required: true
+        type: choice
+        options:
+          - latest
+      hold_seconds:
+        description: "Seconds to keep the isolated run active"
+        required: false
+        default: "0"
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.ref == 'refs/heads/evidence/issue-747-pr-749' && format('proof-exact-review-{0}', inputs.item_key || github.run_id) || format('ci-{0}-{1}', github.workflow, github.ref) }}
   cancel-in-progress: true
 
 jobs:
   check:
     name: pnpm check
+    if: github.ref != 'refs/heads/evidence/issue-747-pr-749'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -86,6 +103,7 @@ jobs:
 
   crawl-remote-toolchain:
     name: crawl-remote toolchain integration
+    if: github.ref != 'refs/heads/evidence/issue-747-pr-749'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -159,6 +177,7 @@ jobs:
 
   windows-codex-launch:
     name: Windows Codex launcher
+    if: github.ref != 'refs/heads/evidence/issue-747-pr-749'
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
@@ -176,3 +195,142 @@ jobs:
           node --test --test-name-pattern
           "escaped Windows launchers|extensionless Windows node shebang shims|CODEX_BIN and preserves argv|timeout errors|app-server mode"
           test/codex-process.test.ts
+
+  exact-review-lifecycle-proof:
+    name: PR 749 review-authority proof
+    if: github.ref == 'refs/heads/evidence/issue-747-pr-749'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CODE_HEAD: e2e199e8978e84a55fe1466992a4878e030f35c3
+      ITEM_KEY: ${{ inputs.item_key }}
+      REVISION: ${{ inputs.revision }}
+      HOLD_SECONDS: ${{ inputs.hold_seconds }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify evidence branch scope and inputs
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$CODE_HEAD" HEAD
+          test "$(git diff --name-only "$CODE_HEAD"..HEAD)" = ".github/workflows/ci.yml"
+          [[ "$ITEM_KEY" =~ ^[a-z0-9-]{1,64}$ ]]
+          test "$REVISION" = "latest"
+          [[ "$HOLD_SECONDS" =~ ^[0-9]+$ ]]
+          test "$HOLD_SECONDS" -le 300
+          {
+            echo "## PR 749 review-authority proof"
+            echo
+            echo "- Item key: \`$ITEM_KEY\`"
+            echo "- Revision: \`$REVISION\`"
+            echo "- Code head: \`$CODE_HEAD\`"
+            echo "- Evidence head: \`$GITHUB_SHA\`"
+            echo "- Run id: \`$GITHUB_RUN_ID\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Hold isolated review active
+        if: ${{ inputs.hold_seconds != '0' }}
+        run: sleep "$HOLD_SECONDS"
+
+      - name: Validate workflow semantics
+        env:
+          ACTIONLINT_VERSION: "1.7.12"
+          ACTIONLINT_LINUX_AMD64_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+        run: |
+          actionlint_archive="${RUNNER_TEMP}/actionlint.tar.gz"
+          curl --fail --show-error --silent --location \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            --output "$actionlint_archive"
+          printf '%s  %s\n' "$ACTIONLINT_LINUX_AMD64_SHA256" "$actionlint_archive" | sha256sum --check -
+          tar -xzf "$actionlint_archive" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" \
+            -shellcheck= \
+            -ignore 'unexpected key "queue" for "concurrency" section' \
+            .github/workflows/*.yml
+
+      - uses: ./.github/actions/setup-pnpm
+
+      - name: Build all TypeScript targets
+        run: pnpm run build:all
+
+      - name: Run review-authority regression suites
+        run: >-
+          node --test
+          test/command.test.ts
+          test/dashboard-worker.test.ts
+          test/clawsweeper.test.ts
+          test/repair/comment-router-core.test.ts
+          test/repair/comment-webhook.test.ts
+          test/review-comment-rendering.test.ts
+          test/sweep-workflow.test.ts
+
+      - name: Lint changed TypeScript and regression tests
+        run: >-
+          pnpm exec oxlint
+          dashboard/exact-review-queue.ts
+          dashboard/worker.ts
+          src/clawsweeper.ts
+          src/repair/comment-router-core.ts
+          src/repair/comment-webhook.ts
+          test/command.test.ts
+          test/dashboard-worker.test.ts
+          test/repair/comment-router-core.test.ts
+          test/repair/comment-webhook.test.ts
+          test/sweep-workflow.test.ts
+          --deny-warnings
+          --report-unused-disable-directives
+          -D correctness
+
+      - name: Verify formatting
+        run: >-
+          pnpm exec oxfmt --check
+          .github/workflows/ci.yml
+          .github/workflows/sweep.yml
+          dashboard/exact-review-queue.ts
+          dashboard/worker.ts
+          docs/limits.md
+          docs/pr-review-comments.md
+          src/clawsweeper.ts
+          src/repair/comment-router-core.ts
+          src/repair/comment-webhook.ts
+          test/command.test.ts
+          test/dashboard-worker.test.ts
+          test/repair/comment-router-core.test.ts
+          test/repair/comment-webhook.test.ts
+          test/sweep-workflow.test.ts
+
+      - name: Record completed proof state
+        run: |
+          set -euo pipefail
+          mkdir -p proof-state
+          node <<'NODE'
+          const fs = require("node:fs");
+          const state = {
+            item_key: process.env.ITEM_KEY,
+            revision: process.env.REVISION,
+            code_head: process.env.CODE_HEAD,
+            evidence_head: process.env.GITHUB_SHA,
+            run_id: process.env.GITHUB_RUN_ID,
+            run_attempt: process.env.GITHUB_RUN_ATTEMPT,
+            coverage: [
+              "stale-A/newer-B lease cleanup fencing",
+              "exact queue tuple authority heartbeat",
+              "sweep.yml repository_dispatch run identity binding",
+              "unrelated run cancellation rejection",
+            ],
+            conclusion: "success",
+            completed_at: new Date().toISOString(),
+          };
+          fs.writeFileSync("proof-state/review-authority.json", `${JSON.stringify(state, null, 2)}\n`);
+          NODE
+          cat proof-state/review-authority.json
+
+      - name: Upload completed proof state
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-749-review-authority-${{ github.run_id }}
+          path: proof-state/review-authority.json
+          if-no-files-found: error
