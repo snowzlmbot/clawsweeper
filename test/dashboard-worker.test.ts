@@ -701,7 +701,7 @@ test("superseding source revisions revoke the old lease and cancel its Actions r
   }
 });
 
-test("superseding source revisions never cancel an unrelated Actions run id", async () => {
+test("superseding source revisions never cancel a different exact-review tuple", async () => {
   const originalFetch = globalThis.fetch;
   const storage = new MemoryDurableStorage();
   const staleHeadSha = "c".repeat(40);
@@ -747,9 +747,9 @@ test("superseding source revisions never cancel an unrelated Actions run id", as
     ) {
       return jsonResponse({
         id: 7550,
-        path: ".github/workflows/other.yml",
-        event: "workflow_dispatch",
-        display_title: "Unrelated workflow",
+        path: ".github/workflows/sweep.yml",
+        event: "repository_dispatch",
+        display_title: `Review exact item openclaw/openclaw#999 rev 1 head ${staleHeadSha}`,
         run_attempt: 1,
         repository: { full_name: "openclaw/clawsweeper" },
       });
