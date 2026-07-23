@@ -871,8 +871,31 @@ jobs:
           test -n "$GH_TOKEN"
           heartbeat_pid=""
           review_pid=""
+          review_pgid=""
           superseded_marker="$RUNNER_TEMP/exact-review-superseded-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           rm -f "$superseded_marker"
+          terminate_review_group() {
+            [ -n "$review_pgid" ] || return 0
+            kill -TERM -- "-$review_pgid" 2>/dev/null || true
+          }
+          wait_for_review_group() {
+            [ -n "$review_pgid" ] || return 0
+            for _ in {1..30}; do
+              if ! kill -0 -- "-$review_pgid" 2>/dev/null; then
+                return 0
+              fi
+              sleep 1
+            done
+            kill -KILL -- "-$review_pgid" 2>/dev/null || true
+            for _ in {1..50}; do
+              if ! kill -0 -- "-$review_pgid" 2>/dev/null; then
+                return 0
+              fi
+              sleep 0.1
+            done
+            echo "::error::Exact-review process group $review_pgid did not terminate."
+            return 1
+          }
           heartbeat_loop() {
             while true; do
               heartbeat_status="$(curl --silent --connect-timeout 5 --max-time 20 \
@@ -885,9 +908,7 @@ jobs:
               if [ "$heartbeat_status" = "409" ]; then
                 echo "::notice::Exact-review heartbeat lost its lease tuple."
                 : > "$superseded_marker"
-                if [ -n "$review_pid" ]; then
-                  kill -TERM "$review_pid" 2>/dev/null || true
-                fi
+                terminate_review_group
                 return
               fi
               sleep 60
@@ -941,7 +962,7 @@ jobs:
           review_timeout_seconds=$((codex_timeout_seconds + media_preprocessing_reserve_seconds + 180))
           echo "::notice::Exact event review timeout is ${review_timeout_seconds}s for per-item Codex timeout ${codex_timeout_seconds}s, reserved media preprocessing ${media_preprocessing_reserve_seconds}s, and detected media allowance ${media_proof_timeout_seconds}s."
           set +e
-          timeout --kill-after=30s "${review_timeout_seconds}s" pnpm run review -- \
+          setsid timeout --kill-after=30s "${review_timeout_seconds}s" pnpm run review -- \
             --target-repo "${{ steps.target.outputs.target_repo }}" \
             --target-dir "${{ steps.target.outputs.target_checkout_dir }}" \
             --artifact-dir artifacts/event \
@@ -960,11 +981,13 @@ jobs:
             --shard-count 1 \
             "${additional_prompt_arg[@]}" &
           review_pid=$!
+          review_pgid=$review_pid
           start_heartbeat
           wait "$review_pid"
           review_exit_code=$?
           cleanup_heartbeat
           if [ -f "$superseded_marker" ]; then
+            wait_for_review_group
             review_exit_code=143
           fi
           set -e

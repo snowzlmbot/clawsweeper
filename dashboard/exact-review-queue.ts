@@ -962,8 +962,19 @@ export class ExactReviewQueue {
           // Ordinary source events retain normal replacement behavior, including the
           // command-context merge for pending items.
           if (!ignoredRecovery) {
+            const commandMergeable = current.state === "pending" || current.state === "parked";
+            // Explicit commands arrive through repository_dispatch without a webhook authority
+            // tuple. Bind them to the pending verified decision via the merge below; source
+            // deliveries still need strictly newer authority before replacing that decision.
+            const bindsCommandToCurrentAuthority =
+              commandMergeable &&
+              Boolean(decision.commandStatusMarker) &&
+              !Object.hasOwn(decision, "sourceHeadSha") &&
+              !Object.hasOwn(decision, "sourceAuthoritySeq");
             const attemptsReviewSupersession =
-              !exactReviewQueueIsPublication(current) && decision.itemKind === "pull_request";
+              !exactReviewQueueIsPublication(current) &&
+              decision.itemKind === "pull_request" &&
+              !bindsCommandToCurrentAuthority;
             const sourceAuthorityIsNewer =
               !attemptsReviewSupersession ||
               exactReviewDecisionCanSupersedeReview(current, decision);

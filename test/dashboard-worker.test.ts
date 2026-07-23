@@ -863,6 +863,106 @@ test("delayed opened pull request delivery cannot replace a newer pending synchr
   assert.equal(state.items["openclaw/openclaw#757"].decision.sourceHeadSha, currentHeadSha);
 });
 
+test("explicit pull request commands bind to pending source authority", async () => {
+  const originalNow = Date.now;
+  const now = 4_000_000;
+  Date.now = () => now;
+  const storage = new MemoryDurableStorage();
+  const currentHeadSha = "b".repeat(40);
+  try {
+    await storage.put("exact-review-queue", {
+      deliveries: {},
+      items: {
+        "openclaw/openclaw#758": {
+          key: "openclaw/openclaw#758",
+          decision: {
+            targetRepo: "openclaw/openclaw",
+            targetBranch: "main",
+            itemNumber: 758,
+            itemKind: "pull_request",
+            sourceEvent: "pull_request",
+            sourceAction: "synchronize",
+            supersedesInProgress: true,
+            sourceHeadSha: currentHeadSha,
+            sourceHeadVerified: true,
+            sourceAuthoritySeq: 2,
+            sourceUpdatedAt: "2026-07-23T13:00:02Z",
+          },
+          state: "pending",
+          revision: 1,
+          createdAt: now,
+          updatedAt: now,
+          nextAttemptAt: now + 90_000,
+          attempts: 0,
+        },
+      },
+    });
+    const queue = new ExactReviewQueue({ storage }, {});
+    const commandStatusMarker =
+      "<!-- clawsweeper-command-status:758:re_review:0123456789abcdef0123456789abcdef01234567 -->";
+
+    const commandResponse = await queue.fetch(
+      buildExactReviewQueueRequest(
+        "explicit-command-758",
+        758,
+        "legacy_dispatch",
+        "pull_request",
+        "openclaw/openclaw",
+        {
+          commandStatusMarker,
+          statusCommentId: 9001,
+        },
+      ),
+    );
+
+    assert.equal(commandResponse.status, 202);
+    assert.equal((await commandResponse.json()).queued, true);
+    let state = (await storage.get("exact-review-queue")) as {
+      items: Record<
+        string,
+        {
+          revision: number;
+          nextAttemptAt: number;
+          decision: Record<string, unknown>;
+        }
+      >;
+    };
+    let current = state.items["openclaw/openclaw#758"];
+    assert.equal(current.revision, 2);
+    assert.equal(current.nextAttemptAt, now);
+    assert.equal(current.decision.sourceHeadSha, currentHeadSha);
+    assert.equal(current.decision.sourceHeadVerified, true);
+    assert.equal(current.decision.sourceAuthoritySeq, 2);
+    assert.equal(current.decision.sourceUpdatedAt, "2026-07-23T13:00:02Z");
+    assert.equal(current.decision.commandStatusMarker, commandStatusMarker);
+    assert.equal(current.decision.statusCommentId, 9001);
+
+    const staleWebhookResponse = await queue.fetch(
+      buildExactReviewQueueRequest(
+        "stale-after-command-758",
+        758,
+        "opened",
+        "pull_request",
+        "openclaw/openclaw",
+        {
+          sourceHeadSha: "a".repeat(40),
+          sourceAuthoritySeq: 1,
+          sourceUpdatedAt: "2026-07-23T13:00:01Z",
+        },
+      ),
+    );
+    assert.equal(staleWebhookResponse.status, 202);
+    assert.equal((await staleWebhookResponse.json()).stale_source, true);
+    state = (await storage.get("exact-review-queue")) as typeof state;
+    current = state.items["openclaw/openclaw#758"];
+    assert.equal(current.revision, 2);
+    assert.equal(current.decision.sourceHeadSha, currentHeadSha);
+    assert.equal(current.decision.commandStatusMarker, commandStatusMarker);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
 test("same-timestamp verified successor replaces the current pull request head", async () => {
   const storage = new MemoryDurableStorage();
   const currentHeadSha = "b".repeat(40);

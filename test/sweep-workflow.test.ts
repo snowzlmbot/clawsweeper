@@ -422,7 +422,10 @@ test("exact event review hands immutable artifacts to the queue-bounded publishe
   assert.match(step(reviewer, "Review exact event item").run ?? "", /claim_generation/);
   assert.match(step(reviewer, "Review exact event item").run ?? "", /run_attempt/);
   assert.match(step(reviewer, "Review exact event item").run ?? "", /source_head_sha/);
-  assert.match(step(reviewer, "Review exact event item").run ?? "", /kill -TERM "\$review_pid"/);
+  assert.match(
+    step(reviewer, "Review exact event item").run ?? "",
+    /kill -TERM -- "-\$review_pgid"/,
+  );
   assert.match(step(reviewer, "Review exact event item").run ?? "", /sleep 60/);
 
   const create = step(reviewer, "Create exact review artifact bundle");
@@ -770,6 +773,11 @@ test("exact event review heartbeats its queue lease while Codex runs", () => {
   assert.doesNotMatch(review.run ?? "", /test -n "\$CLAWSWEEPER_WEBHOOK_SECRET"/);
   assert.match(review.run ?? "", /trap cleanup_heartbeat EXIT/);
   assert.match(review.run ?? "", /kill "\$heartbeat_pid" 2>\/dev\/null \|\| true/);
+  assert.match(review.run ?? "", /setsid timeout --kill-after=30s/);
+  assert.match(review.run ?? "", /review_pgid=\$review_pid/);
+  assert.match(review.run ?? "", /kill -TERM -- "-\$review_pgid"/);
+  assert.match(review.run ?? "", /kill -KILL -- "-\$review_pgid"/);
+  assert.match(review.run ?? "", /wait_for_review_group/);
 
   const publisher = workflow.jobs["event-review-publish"]!;
   assert.equal(
