@@ -32,9 +32,12 @@ shard posts a short status placeholder with the same durable identity marker.
 The placeholder is intentionally light and crustacean-friendly, then the final
 review sync edits that exact comment in place.
 
-When a newer source revision acquires its lease, ClawSweeper deletes dedicated
-review-start placeholders for older revisions immediately. It never deletes a
-same-revision lease during this step; same-revision contenders still use the
+After a newer source revision wins its lease, ClawSweeper may delete dedicated
+review-start placeholders for older revisions. The candidate comment snapshot
+is captured first, then the worker must still own the exact queue
+item/lease/revision/generation/run tuple and the live item revision must match
+its lease. A stale worker therefore cannot treat a newer lease as superseded
+just because the SHAs differ. Same-revision contenders still use the
 server-assigned comment-id election, and expired leftovers retain the existing
 conservative cleanup path.
 

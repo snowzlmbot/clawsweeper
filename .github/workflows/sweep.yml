@@ -17,7 +17,7 @@ run-name: >-
       github.event.action == 'clawsweeper_target_sweep') &&
       format('Review target repo {0}', github.event.client_payload.target_repo || 'openclaw/openclaw') ||
     (github.event_name == 'repository_dispatch' && github.event.client_payload.queue_lease_id != '') &&
-      format('Review event item {0}', github.event.client_payload.queue_claim.item_key || github.event.client_payload.item_key || '?') ||
+      format('Review exact item {0} rev {1} head {2}', github.event.client_payload.queue_claim.item_key || github.event.client_payload.item_key || '?', github.event.client_payload.queue_claim.lease_revision || github.event.client_payload.lease_revision || '?', github.event.client_payload.source_head_sha || 'na') ||
     (github.event_name == 'repository_dispatch' && github.event.client_payload.dispatch_key != '') &&
       format('Review event item {0}#{1} [{2}]', github.event.client_payload.target_repo || 'openclaw/openclaw', github.event.client_payload.item_number || '?', github.event.client_payload.dispatch_key) ||
     github.event_name == 'repository_dispatch' &&
@@ -278,6 +278,9 @@ jobs:
                 sourceEvent,
                 sourceAction: payload.source_action || "legacy_dispatch",
                 supersedesInProgress: payload.supersedes_in_progress === true,
+                ...(/^[0-9a-f]{40}$/.test(String(payload.source_head_sha || "").trim().toLowerCase())
+                  ? { sourceHeadSha: String(payload.source_head_sha).trim().toLowerCase() }
+                  : {}),
                 ...(Number.isFinite(Number(payload.codex_timeout_ms))
                   ? { codexTimeoutMs: Number(payload.codex_timeout_ms) }
                   : {}),
@@ -413,6 +416,9 @@ jobs:
                   sourceEvent: String(dispatch.source_event || ""),
                   sourceAction: String(dispatch.source_action || "legacy_dispatch"),
                   supersedesInProgress: dispatch.supersedes_in_progress === true,
+                  ...(/^[0-9a-f]{40}$/.test(String(dispatch.source_head_sha || "").trim().toLowerCase())
+                    ? { sourceHeadSha: String(dispatch.source_head_sha).trim().toLowerCase() }
+                    : {}),
                   ...(Number.isFinite(Number(reviewOptions.codex_timeout_ms))
                     ? { codexTimeoutMs: Number(reviewOptions.codex_timeout_ms) }
                     : {}),
@@ -785,6 +791,11 @@ jobs:
           ITEM_NUMBER: ${{ steps.target.outputs.item_number }}
           CODEX_TIMEOUT_MS: ${{ steps.target.outputs.codex_timeout_ms }}
           MEDIA_PROOF_TIMEOUT_MS: ${{ steps.target.outputs.media_proof_timeout_ms }}
+          EXACT_REVIEW_ITEM_KEY: ${{ steps.claim-exact-review-queue.outputs.item_key }}
+          EXACT_REVIEW_LEASE_ID: ${{ steps.claim-exact-review-queue.outputs.lease_id }}
+          EXACT_REVIEW_LEASE_REVISION: ${{ steps.claim-exact-review-queue.outputs.lease_revision }}
+          EXACT_REVIEW_CLAIM_GENERATION: ${{ steps.claim-exact-review-queue.outputs.claim_generation }}
+          EXACT_REVIEW_QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
         run: |
           set -euo pipefail
           test -n "$GH_TOKEN"
@@ -849,6 +860,7 @@ jobs:
           EXACT_REVIEW_ITEM_KEY: ${{ steps.claim-exact-review-queue.outputs.item_key }}
           EXACT_REVIEW_LEASE_ID: ${{ steps.claim-exact-review-queue.outputs.lease_id }}
           EXACT_REVIEW_LEASE_REVISION: ${{ steps.claim-exact-review-queue.outputs.lease_revision }}
+          EXACT_REVIEW_CLAIM_GENERATION: ${{ steps.claim-exact-review-queue.outputs.claim_generation }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
           REVIEW_LEASE_OWNER: ${{ steps.reserve-exact-review-lease.outputs.owner }}
           REVIEW_LEASE_COMMENT_ID: ${{ steps.reserve-exact-review-lease.outputs.comment_id }}
@@ -877,13 +889,19 @@ jobs:
             # claim/complete), so this Codex-adjacent step never sees the webhook secret.
             heartbeat_payload="$(node -e '
               const leaseRevision = Number(process.env.EXACT_REVIEW_LEASE_REVISION);
+              const claimGeneration = Number(process.env.EXACT_REVIEW_CLAIM_GENERATION);
+              const runAttempt = Number(process.env.GITHUB_RUN_ATTEMPT);
               if (!process.env.EXACT_REVIEW_ITEM_KEY || !process.env.EXACT_REVIEW_LEASE_ID) process.exit(1);
               if (!Number.isInteger(leaseRevision) || leaseRevision < 1) process.exit(1);
+              if (!Number.isInteger(claimGeneration) || claimGeneration < 1) process.exit(1);
+              if (!Number.isInteger(runAttempt) || runAttempt < 1) process.exit(1);
               process.stdout.write(JSON.stringify({
                 item_key: process.env.EXACT_REVIEW_ITEM_KEY,
                 lease_id: process.env.EXACT_REVIEW_LEASE_ID,
                 lease_revision: leaseRevision,
+                claim_generation: claimGeneration,
                 run_id: process.env.GITHUB_RUN_ID,
+                run_attempt: runAttempt,
               }));
             ')" || return 0
             heartbeat_loop &

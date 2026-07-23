@@ -1678,9 +1678,36 @@ test("superseded review start leases select only trusted dedicated comments for 
       ],
       itemNumber,
       headSha: currentHead,
+      authoritativeHeadSha: currentHead,
       trustedAuthors: new Set(["clawsweeper[bot]"]),
     }),
     [{ commentId: 101, headSha: oldHead }],
+  );
+});
+
+test("stale review A cannot classify newer-head lease B as superseded", () => {
+  const itemNumber = 24;
+  const staleHead = "a".repeat(40);
+  const authoritativeHead = "b".repeat(40);
+  const newerLease = {
+    id: 202,
+    user: { login: "clawsweeper[bot]" },
+    body: [
+      "ClawSweeper status: review started.",
+      `<!-- clawsweeper-review-status:started item=${itemNumber} sha=${authoritativeHead} started_at=2026-07-21T05:01:00.000Z lease_expires_at=2026-07-21T06:01:00.000Z owner=worker-b v=1 -->`,
+      `<!-- clawsweeper-review-lease item=${itemNumber} -->`,
+    ].join("\n"),
+  };
+
+  assert.deepEqual(
+    supersededReviewStartStatusLeases({
+      comments: [newerLease],
+      itemNumber,
+      headSha: staleHead,
+      authoritativeHeadSha: authoritativeHead,
+      trustedAuthors: new Set(["clawsweeper[bot]"]),
+    }),
+    [],
   );
 });
 

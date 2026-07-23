@@ -1957,20 +1957,26 @@ export function supersededReviewStartStatusLeases({
   comments,
   itemNumber,
   headSha,
+  authoritativeHeadSha,
   trustedAuthors = new Set<string>(),
 }: {
   comments: LooseRecord[];
   itemNumber: number;
   headSha: string;
+  authoritativeHeadSha: string;
   trustedAuthors?: ReadonlySet<string>;
 }): Array<{ commentId: number; headSha: string }> {
   const normalizedHead = String(headSha ?? "")
     .trim()
     .toLowerCase();
+  const normalizedAuthoritativeHead = String(authoritativeHeadSha ?? "")
+    .trim()
+    .toLowerCase();
   if (
     !Number.isInteger(itemNumber) ||
     itemNumber <= 0 ||
-    !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(normalizedHead)
+    !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(normalizedHead) ||
+    normalizedAuthoritativeHead !== normalizedHead
   ) {
     return [];
   }
