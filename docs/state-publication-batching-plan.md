@@ -199,8 +199,10 @@ The same invariant is available as an explicit historical backfill through
 `/internal/exact-review/publications/reconcile` and
 `.github/workflows/exact-review-queue-maintenance.yml`. The workflow runs a
 dry-run by default and can apply exactly one pass of at most 100 removals per
-manual dispatch. It is not scheduled and cannot loop through multiple passes in
-one run. A pass considers only `pending` and `parked` protocol-v2 publications.
+manual dispatch. The deprecated `passes` input remains accepted for existing
+dispatch callers, but values above one are explicitly logged and clamped to one
+observed pass. The workflow is not scheduled and cannot loop through multiple
+passes in one run. A pass considers only `pending` and `parked` protocol-v2 publications.
 It never removes `dispatching`, `leased`, or active-batch-owned rows. For a
 current lineage without an active owner, it preserves the oldest queue slot and
 its retry/failure budget, refreshes that slot to the newest known producer
