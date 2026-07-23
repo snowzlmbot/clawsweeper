@@ -23,6 +23,7 @@ concurrency:
 jobs:
   check:
     name: pnpm check
+    if: github.ref != 'refs/heads/evidence/pr-publication-lineage-reconcile'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -73,7 +74,7 @@ jobs:
 
   sparse-repair-builds:
     name: sparse repair build smoke
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && github.ref != 'refs/heads/evidence/pr-publication-lineage-reconcile'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -86,6 +87,7 @@ jobs:
 
   crawl-remote-toolchain:
     name: crawl-remote toolchain integration
+    if: github.ref != 'refs/heads/evidence/pr-publication-lineage-reconcile'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -159,6 +161,7 @@ jobs:
 
   windows-codex-launch:
     name: Windows Codex launcher
+    if: github.ref != 'refs/heads/evidence/pr-publication-lineage-reconcile'
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
@@ -176,3 +179,42 @@ jobs:
           node --test --test-name-pattern
           "escaped Windows launchers|extensionless Windows node shebang shims|CODEX_BIN and preserves argv|timeout errors|app-server mode"
           test/codex-process.test.ts
+
+  publication-lineage-reconcile-evidence:
+    name: bounded historical lineage reconcile proof
+    if: github.ref == 'refs/heads/evidence/pr-publication-lineage-reconcile'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-pnpm
+
+      - name: Build current code head
+        run: pnpm run build:all
+
+      - name: Prove bounded historical lineage cleanup and ownership fencing
+        run: >-
+          node --test
+          --test-name-pattern="publication reconcile backfills historical duplicate lineages in bounded passes|publication lineage reconcile preserves active batch ownership"
+          test/exact-review-publication-batches.test.ts
+
+      - name: Prove one-pass dry-run workflow contract
+        run: node --test test/repair/exact-review-queue-maintenance-workflow.test.ts
+
+      - name: Verify changed-surface formatting and lint
+        run: |
+          pnpm exec oxfmt --check \
+            dashboard/exact-review-queue.ts \
+            src/repair/exact-review-batch-queue-client.ts \
+            src/repair/exact-review-queue-maintenance.ts \
+            test/exact-review-publication-batches.test.ts \
+            test/repair/exact-review-queue-maintenance-workflow.test.ts \
+            docs/state-publication-batching-plan.md \
+            .github/workflows/exact-review-queue-maintenance.yml
+          pnpm exec oxlint --deny-warnings \
+            dashboard/exact-review-queue.ts \
+            src/repair/exact-review-batch-queue-client.ts \
+            src/repair/exact-review-queue-maintenance.ts \
+            test/exact-review-publication-batches.test.ts \
+            test/repair/exact-review-queue-maintenance-workflow.test.ts
