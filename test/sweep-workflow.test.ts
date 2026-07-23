@@ -399,6 +399,10 @@ test("exact event review hands immutable artifacts to the queue-bounded publishe
     reserveLease.env?.EXACT_REVIEW_CLAIM_GENERATION,
     "${{ steps.claim-exact-review-queue.outputs.claim_generation }}",
   );
+  assert.equal(
+    reserveLease.env?.EXACT_REVIEW_SOURCE_HEAD_SHA,
+    "${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).sourceHeadSha || '' }}",
+  );
   const resolvePayload = step(reviewer, "Resolve event payload");
   assert.match(resolvePayload.run ?? "", /maxExactReviewCodexTimeoutMs = 2_700_000/);
   assert.match(
@@ -417,6 +421,9 @@ test("exact event review hands immutable artifacts to the queue-bounded publishe
   assert.match(step(reviewer, "Review exact event item").run ?? "", /--review-lease-comment-id/);
   assert.match(step(reviewer, "Review exact event item").run ?? "", /claim_generation/);
   assert.match(step(reviewer, "Review exact event item").run ?? "", /run_attempt/);
+  assert.match(step(reviewer, "Review exact event item").run ?? "", /source_head_sha/);
+  assert.match(step(reviewer, "Review exact event item").run ?? "", /kill -TERM "\$review_pid"/);
+  assert.match(step(reviewer, "Review exact event item").run ?? "", /sleep 60/);
 
   const create = step(reviewer, "Create exact review artifact bundle");
   const upload = step(reviewer, "Upload exact review artifact bundle");

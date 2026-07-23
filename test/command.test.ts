@@ -346,6 +346,7 @@ process.stdout.write("200");
           EXACT_REVIEW_LEASE_ID: "lease-357",
           EXACT_REVIEW_LEASE_REVISION: "1",
           EXACT_REVIEW_CLAIM_GENERATION: "1",
+          EXACT_REVIEW_SOURCE_HEAD_SHA: staleHead,
         },
       },
     );

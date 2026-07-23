@@ -548,8 +548,7 @@ test("exact-review queue protects an active batch lineage from a later duplicate
   );
 });
 
-test("superseding source revisions revoke the old lease and cancel its Actions run", async () => {
-  const originalFetch = globalThis.fetch;
+test("superseding source revisions revoke the old lease without Actions cancellation", async () => {
   const originalNow = Date.now;
   const now = 3_000_000;
   Date.now = () => now;
@@ -579,49 +578,10 @@ test("superseding source revisions revoke the old lease and cancel its Actions r
     deliveries: {},
     items: { "openclaw/openclaw#753": stale },
   });
-  const { privateKey } = generateKeyPairSync("rsa", {
-    modulusLength: 2048,
-    privateKeyEncoding: { type: "pkcs8", format: "pem" },
-    publicKeyEncoding: { type: "spki", format: "pem" },
-  });
-  const cancelled: string[] = [];
-  const requestedPermissions: Array<Record<string, string>> = [];
-  globalThis.fetch = async (input, init) => {
-    const url = new URL(String(input));
-    if (url.pathname === "/repos/openclaw/clawsweeper/installation") {
-      return jsonResponse({ id: 999 });
-    }
-    if (url.pathname === "/app/installations/999/access_tokens") {
-      requestedPermissions.push(JSON.parse(String(init?.body)).permissions);
-      return jsonResponse({ token: `actions-token-${requestedPermissions.length}` });
-    }
-    if (
-      url.pathname === "/repos/openclaw/clawsweeper/actions/runs/7530" &&
-      init?.method === "GET"
-    ) {
-      return jsonResponse({
-        id: 7530,
-        path: ".github/workflows/sweep.yml",
-        event: "repository_dispatch",
-        display_title: `Review exact item openclaw/openclaw#753 rev 1 head ${staleHeadSha}`,
-        run_attempt: 1,
-        repository: { full_name: "openclaw/clawsweeper" },
-      });
-    }
-    if (url.pathname === "/repos/openclaw/clawsweeper/actions/runs/7530/cancel") {
-      assert.ok((await storage.getAlarm()) !== null);
-      cancelled.push(url.pathname);
-      return new Response(null, { status: 202 });
-    }
-    throw new Error(`unexpected fetch ${url}`);
-  };
-
   try {
     const queue = new ExactReviewQueue(
       { storage },
       {
-        CLAWSWEEPER_APP_CLIENT_ID: "Iv23test",
-        CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
         EXACT_REVIEW_DISPATCH_DEBOUNCE_MS: "90000",
         EXACT_REVIEW_DISPATCH_DEBOUNCE_MAX_MS: "180000",
       },
@@ -638,8 +598,6 @@ test("superseding source revisions revoke the old lease and cancel its Actions r
     );
 
     assert.equal(response.status, 202);
-    assert.deepEqual(cancelled, ["/repos/openclaw/clawsweeper/actions/runs/7530/cancel"]);
-    assert.deepEqual(requestedPermissions, [{ actions: "read" }, { actions: "write" }]);
     const state = (await storage.get("exact-review-queue")) as {
       items: Record<string, Record<string, unknown>>;
     };
@@ -696,13 +654,11 @@ test("superseding source revisions revoke the old lease and cancel its Actions r
     assert.equal(staleCompletion.status, 409);
     assert.deepEqual(await staleCompletion.json(), { error: "lease_not_claimed" });
   } finally {
-    globalThis.fetch = originalFetch;
     Date.now = originalNow;
   }
 });
 
-test("superseding source revisions never cancel a different exact-review tuple", async () => {
-  const originalFetch = globalThis.fetch;
+test("exact-review heartbeat binds a claimed pull request source head", async () => {
   const storage = new MemoryDurableStorage();
   const staleHeadSha = "c".repeat(40);
   const staleBase = leasedExactReviewQueueItem(755, "7550");
@@ -725,67 +681,26 @@ test("superseding source revisions never cancel a different exact-review tuple",
     deliveries: {},
     items: { "openclaw/openclaw#755": stale },
   });
-  const { privateKey } = generateKeyPairSync("rsa", {
-    modulusLength: 2048,
-    privateKeyEncoding: { type: "pkcs8", format: "pem" },
-    publicKeyEncoding: { type: "spki", format: "pem" },
-  });
-  const cancelled: string[] = [];
-  const requestedPermissions: Array<Record<string, string>> = [];
-  globalThis.fetch = async (input, init) => {
-    const url = new URL(String(input));
-    if (url.pathname === "/repos/openclaw/clawsweeper/installation") {
-      return jsonResponse({ id: 999 });
-    }
-    if (url.pathname === "/app/installations/999/access_tokens") {
-      requestedPermissions.push(JSON.parse(String(init?.body)).permissions);
-      return jsonResponse({ token: "actions-read-token" });
-    }
-    if (
-      url.pathname === "/repos/openclaw/clawsweeper/actions/runs/7550" &&
-      init?.method === "GET"
-    ) {
-      return jsonResponse({
-        id: 7550,
-        path: ".github/workflows/sweep.yml",
-        event: "repository_dispatch",
-        display_title: `Review exact item openclaw/openclaw#999 rev 1 head ${staleHeadSha}`,
-        run_attempt: 1,
-        repository: { full_name: "openclaw/clawsweeper" },
-      });
-    }
-    if (url.pathname.endsWith("/actions/runs/7550/cancel")) {
-      cancelled.push(url.pathname);
-      return new Response(null, { status: 202 });
-    }
-    throw new Error(`unexpected fetch ${url}`);
-  };
-
-  try {
-    const queue = new ExactReviewQueue(
-      { storage },
-      {
-        CLAWSWEEPER_APP_CLIENT_ID: "Iv23test",
-        CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
-      },
-    );
-    const response = await queue.fetch(
-      buildExactReviewQueueRequest(
-        "superseding-unrelated-run-755",
-        755,
-        "synchronize",
-        "pull_request",
-        "openclaw/openclaw",
-        { sourceHeadSha: "d".repeat(40) },
-      ),
+  const queue = new ExactReviewQueue({ storage }, {});
+  const heartbeat = (sourceHeadSha?: string) =>
+    queue.fetch(
+      new Request("https://clawsweeper-exact-review-queue/heartbeat", {
+        method: "POST",
+        body: JSON.stringify({
+          item_key: "openclaw/openclaw#755",
+          lease_id: "lease-755",
+          lease_revision: 1,
+          claim_generation: 1,
+          run_id: "7550",
+          run_attempt: 1,
+          ...(sourceHeadSha ? { source_head_sha: sourceHeadSha } : {}),
+        }),
+      }),
     );
 
-    assert.equal(response.status, 202);
-    assert.deepEqual(cancelled, []);
-    assert.deepEqual(requestedPermissions, [{ actions: "read" }]);
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+  assert.equal((await heartbeat()).status, 409);
+  assert.equal((await heartbeat("d".repeat(40))).status, 409);
+  assert.equal((await heartbeat(staleHeadSha)).status, 200);
 });
 
 test("recovery revisions cannot supersede an active authoritative exact review", async () => {

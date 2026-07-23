@@ -526,6 +526,7 @@ type ExactReviewQueueAuthority = {
   claimGeneration: number;
   runId: string;
   runAttempt: number;
+  sourceHeadSha: string | null;
 };
 
 type ReviewStartStatusCommentResult =
@@ -20630,6 +20631,9 @@ function exactReviewQueueAuthorityFromEnv(
     claimGeneration: String(env.EXACT_REVIEW_CLAIM_GENERATION ?? "").trim(),
     runId: String(env.GITHUB_RUN_ID ?? "").trim(),
     runAttempt: String(env.GITHUB_RUN_ATTEMPT ?? "").trim(),
+    sourceHeadSha: String(env.EXACT_REVIEW_SOURCE_HEAD_SHA ?? "")
+      .trim()
+      .toLowerCase(),
   };
   if (
     ![raw.queueUrl, raw.itemKey, raw.leaseId, raw.leaseRevision, raw.claimGeneration].some(Boolean)
@@ -20656,7 +20660,8 @@ function exactReviewQueueAuthorityFromEnv(
     claimGeneration < 1 ||
     !/^[1-9]\d{0,29}$/.test(raw.runId) ||
     !Number.isSafeInteger(runAttempt) ||
-    runAttempt < 1
+    runAttempt < 1 ||
+    (raw.sourceHeadSha !== "" && !/^[0-9a-f]{40}$/.test(raw.sourceHeadSha))
   ) {
     throw new UserFacingCommandError("Exact-review queue authority context is incomplete.");
   }
@@ -20668,6 +20673,7 @@ function exactReviewQueueAuthorityFromEnv(
     claimGeneration,
     runId: raw.runId,
     runAttempt,
+    sourceHeadSha: raw.sourceHeadSha || null,
   };
 }
 
@@ -20679,6 +20685,7 @@ function exactReviewQueueAuthorityIsLive(authority: ExactReviewQueueAuthority): 
     claim_generation: authority.claimGeneration,
     run_id: authority.runId,
     run_attempt: authority.runAttempt,
+    ...(authority.sourceHeadSha ? { source_head_sha: authority.sourceHeadSha } : {}),
   });
   const result = spawnSync(
     "curl",
@@ -22823,6 +22830,15 @@ function reserveReviewLeaseCommand(args: Args): void {
   if (!currentRevision || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(currentRevision)) {
     throw new UserFacingCommandError(
       `Could not resolve the current review revision for #${itemNumber}.`,
+    );
+  }
+  if (
+    queueAuthority &&
+    item.kind === "pull_request" &&
+    queueAuthority.sourceHeadSha !== currentRevision
+  ) {
+    throw new UserFacingCommandError(
+      "Exact-review queue authority source head does not match the current pull request.",
     );
   }
   const result = postReviewStartStatusComment({

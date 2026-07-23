@@ -795,6 +795,7 @@ jobs:
           EXACT_REVIEW_LEASE_ID: ${{ steps.claim-exact-review-queue.outputs.lease_id }}
           EXACT_REVIEW_LEASE_REVISION: ${{ steps.claim-exact-review-queue.outputs.lease_revision }}
           EXACT_REVIEW_CLAIM_GENERATION: ${{ steps.claim-exact-review-queue.outputs.claim_generation }}
+          EXACT_REVIEW_SOURCE_HEAD_SHA: ${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).sourceHeadSha || '' }}
           EXACT_REVIEW_QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
         run: |
           set -euo pipefail
@@ -861,6 +862,7 @@ jobs:
           EXACT_REVIEW_LEASE_ID: ${{ steps.claim-exact-review-queue.outputs.lease_id }}
           EXACT_REVIEW_LEASE_REVISION: ${{ steps.claim-exact-review-queue.outputs.lease_revision }}
           EXACT_REVIEW_CLAIM_GENERATION: ${{ steps.claim-exact-review-queue.outputs.claim_generation }}
+          EXACT_REVIEW_SOURCE_HEAD_SHA: ${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).sourceHeadSha || '' }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
           REVIEW_LEASE_OWNER: ${{ steps.reserve-exact-review-lease.outputs.owner }}
           REVIEW_LEASE_COMMENT_ID: ${{ steps.reserve-exact-review-lease.outputs.comment_id }}
@@ -868,6 +870,9 @@ jobs:
           set -euo pipefail
           test -n "$GH_TOKEN"
           heartbeat_pid=""
+          review_pid=""
+          superseded_marker="$RUNNER_TEMP/exact-review-superseded-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          rm -f "$superseded_marker"
           heartbeat_loop() {
             while true; do
               heartbeat_status="$(curl --silent --connect-timeout 5 --max-time 20 \
@@ -879,9 +884,13 @@ jobs:
                 "${QUEUE_URL%/}/internal/exact-review/heartbeat" 2>/dev/null)" || heartbeat_status=""
               if [ "$heartbeat_status" = "409" ]; then
                 echo "::notice::Exact-review heartbeat lost its lease tuple."
+                : > "$superseded_marker"
+                if [ -n "$review_pid" ]; then
+                  kill -TERM "$review_pid" 2>/dev/null || true
+                fi
                 return
               fi
-              sleep 300
+              sleep 60
             done
           }
           start_heartbeat() {
@@ -891,10 +900,12 @@ jobs:
               const leaseRevision = Number(process.env.EXACT_REVIEW_LEASE_REVISION);
               const claimGeneration = Number(process.env.EXACT_REVIEW_CLAIM_GENERATION);
               const runAttempt = Number(process.env.GITHUB_RUN_ATTEMPT);
+              const sourceHeadSha = String(process.env.EXACT_REVIEW_SOURCE_HEAD_SHA || "").trim().toLowerCase();
               if (!process.env.EXACT_REVIEW_ITEM_KEY || !process.env.EXACT_REVIEW_LEASE_ID) process.exit(1);
               if (!Number.isInteger(leaseRevision) || leaseRevision < 1) process.exit(1);
               if (!Number.isInteger(claimGeneration) || claimGeneration < 1) process.exit(1);
               if (!Number.isInteger(runAttempt) || runAttempt < 1) process.exit(1);
+              if (sourceHeadSha && !/^[0-9a-f]{40}$/.test(sourceHeadSha)) process.exit(1);
               process.stdout.write(JSON.stringify({
                 item_key: process.env.EXACT_REVIEW_ITEM_KEY,
                 lease_id: process.env.EXACT_REVIEW_LEASE_ID,
@@ -902,6 +913,7 @@ jobs:
                 claim_generation: claimGeneration,
                 run_id: process.env.GITHUB_RUN_ID,
                 run_attempt: runAttempt,
+                ...(sourceHeadSha ? { source_head_sha: sourceHeadSha } : {}),
               }));
             ')" || return 0
             heartbeat_loop &
@@ -912,7 +924,6 @@ jobs:
             kill "$heartbeat_pid" 2>/dev/null || true
             wait "$heartbeat_pid" 2>/dev/null || true
           }
-          start_heartbeat
           trap cleanup_heartbeat EXIT
           codex_timeout_ms="${{ steps.target.outputs.codex_timeout_ms }}"
           if ! [[ "$codex_timeout_ms" =~ ^[0-9]+$ ]] || [ "$codex_timeout_ms" -lt 1 ]; then
@@ -947,8 +958,15 @@ jobs:
             --review-lease-comment-id "$REVIEW_LEASE_COMMENT_ID" \
             --shard-index 0 \
             --shard-count 1 \
-            "${additional_prompt_arg[@]}"
+            "${additional_prompt_arg[@]}" &
+          review_pid=$!
+          start_heartbeat
+          wait "$review_pid"
           review_exit_code=$?
+          cleanup_heartbeat
+          if [ -f "$superseded_marker" ]; then
+            review_exit_code=143
+          fi
           set -e
           echo "exit_code=$review_exit_code" >> "$GITHUB_OUTPUT"
           if [ "$review_exit_code" -ne 0 ]; then
