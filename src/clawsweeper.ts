@@ -21076,9 +21076,9 @@ function pullRequestHeadSha(number: number): string {
 }
 
 function currentReviewRevision(item: Item): string {
-  return item.kind === "pull_request"
-    ? pullRequestHeadSha(item.number)
-    : collectItemContext(item, { fullTimelineForRelations: true }).sourceRevision;
+  if (item.kind === "pull_request") return pullRequestHeadSha(item.number);
+  const revision = collectItemContext(item, { fullTimelineForRelations: true }).sourceRevision;
+  return typeof revision === "string" ? revision : "";
 }
 
 function closeItem(options: { number: number; kind: ItemKind; reason: CloseReason }): void {
