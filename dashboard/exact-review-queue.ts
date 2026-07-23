@@ -962,15 +962,18 @@ export class ExactReviewQueue {
           // Ordinary source events retain normal replacement behavior, including the
           // command-context merge for pending items.
           if (!ignoredRecovery) {
-            const commandMergeable = current.state === "pending" || current.state === "parked";
             // Explicit commands arrive through repository_dispatch without a webhook authority
-            // tuple. Bind them to the pending verified decision via the merge below; source
-            // deliveries still need strictly newer authority before replacing that decision.
+            // tuple. Bind them to the current verified decision via the merge below. An active
+            // review keeps its lease and exposes the command as a follow-up revision on completion.
             const bindsCommandToCurrentAuthority =
-              commandMergeable &&
+              decision.itemKind === "pull_request" &&
+              (current.leaseDecision || current.decision).itemKind === "pull_request" &&
               Boolean(decision.commandStatusMarker) &&
               !Object.hasOwn(decision, "sourceHeadSha") &&
               !Object.hasOwn(decision, "sourceAuthoritySeq");
+            const queuesCommandFollowUp =
+              bindsCommandToCurrentAuthority &&
+              (current.state === "dispatching" || current.state === "leased");
             const attemptsReviewSupersession =
               !exactReviewQueueIsPublication(current) &&
               decision.itemKind === "pull_request" &&
@@ -988,6 +991,7 @@ export class ExactReviewQueue {
               };
             }
             const supersedesActiveReview =
+              !bindsCommandToCurrentAuthority &&
               sourceAuthorityIsNewer &&
               decision.supersedesInProgress &&
               (current.state === "dispatching" || current.state === "leased");
@@ -1010,7 +1014,7 @@ export class ExactReviewQueue {
             const mergeable = current.state === "pending" || current.state === "parked";
             current.decision = supersedesActiveReview
               ? decision
-              : mergeable
+              : mergeable || queuesCommandFollowUp
                 ? mergePendingExactReviewDecision(current.decision, decision)
                 : decision;
             current.revision += 1;

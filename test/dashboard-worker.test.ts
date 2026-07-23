@@ -963,6 +963,182 @@ test("explicit pull request commands bind to pending source authority", async ()
   }
 });
 
+test("explicit pull request commands queue behind a dispatching authoritative review", async () => {
+  const storage = new MemoryDurableStorage();
+  const currentHeadSha = "b".repeat(40);
+  const item = unclaimedExactReviewQueueItem(759);
+  item.decision = {
+    ...item.decision,
+    itemKind: "pull_request",
+    sourceEvent: "pull_request",
+    sourceAction: "synchronize",
+    supersedesInProgress: true,
+    sourceHeadSha: currentHeadSha,
+    sourceHeadVerified: true,
+    sourceAuthoritySeq: 2,
+    sourceUpdatedAt: "2026-07-23T13:00:02Z",
+  };
+  item.leaseDecision = { ...item.decision };
+  await storage.put("exact-review-queue", {
+    deliveries: {},
+    items: { "openclaw/openclaw#759": item },
+  });
+  const queue = new ExactReviewQueue({ storage }, {});
+  const commandStatusMarker =
+    "<!-- clawsweeper-command-status:759:re_review:0123456789abcdef0123456789abcdef01234567 -->";
+  const command = buildExactReviewQueueRequest(
+    "explicit-command-dispatching-759",
+    759,
+    "legacy_dispatch",
+    "pull_request",
+    "openclaw/openclaw",
+    {
+      commandStatusMarker,
+      statusCommentId: 9002,
+      additionalPrompt: "Inspect the command-requested dispatching follow-up.",
+    },
+  );
+
+  const response = await queue.fetch(command.clone());
+  assert.equal(response.status, 202);
+  assert.equal((await response.json()).queued, true);
+  const afterCommand = structuredClone(await storage.get("exact-review-queue")) as {
+    items: Record<
+      string,
+      {
+        state: string;
+        revision: number;
+        leaseId?: string;
+        leaseRevision?: number;
+        decision: Record<string, unknown>;
+        leaseDecision?: Record<string, unknown>;
+      }
+    >;
+  };
+  const current = afterCommand.items["openclaw/openclaw#759"];
+  assert.equal(current.state, "dispatching");
+  assert.equal(current.revision, 2);
+  assert.equal(current.leaseId, "lease-759");
+  assert.equal(current.leaseRevision, 1);
+  assert.equal(current.leaseDecision?.commandStatusMarker, undefined);
+  assert.equal(current.leaseDecision?.sourceHeadSha, currentHeadSha);
+  assert.equal(current.decision.sourceHeadSha, currentHeadSha);
+  assert.equal(current.decision.sourceAuthoritySeq, 2);
+  assert.equal(current.decision.commandStatusMarker, commandStatusMarker);
+  assert.equal(current.decision.statusCommentId, 9002);
+  assert.equal(
+    current.decision.additionalPrompt,
+    "Inspect the command-requested dispatching follow-up.",
+  );
+
+  const redelivery = await queue.fetch(command);
+  assert.equal(redelivery.status, 202);
+  assert.equal((await redelivery.json()).deduped, true);
+  assert.deepEqual(await storage.get("exact-review-queue"), afterCommand);
+});
+
+test("explicit pull request commands survive an active authoritative lease completion", async () => {
+  const storage = new MemoryDurableStorage();
+  const currentHeadSha = "c".repeat(40);
+  const item = leasedExactReviewQueueItem(760, "7600");
+  item.decision = {
+    ...item.decision,
+    itemKind: "pull_request",
+    sourceEvent: "pull_request",
+    sourceAction: "synchronize",
+    supersedesInProgress: true,
+    sourceHeadSha: currentHeadSha,
+    sourceHeadVerified: true,
+    sourceAuthoritySeq: 3,
+    sourceUpdatedAt: "2026-07-23T13:00:03Z",
+  };
+  item.leaseDecision = { ...item.decision };
+  await storage.put("exact-review-queue", {
+    deliveries: {},
+    items: { "openclaw/openclaw#760": item },
+  });
+  const queue = new ExactReviewQueue({ storage }, {});
+  const commandStatusMarker =
+    "<!-- clawsweeper-command-status:760:re_review:abcdef0123456789abcdef0123456789abcdef01 -->";
+  const command = buildExactReviewQueueRequest(
+    "explicit-command-leased-760",
+    760,
+    "legacy_dispatch",
+    "pull_request",
+    "openclaw/openclaw",
+    {
+      commandStatusMarker,
+      statusCommentId: 9003,
+      additionalPrompt: "Inspect the command-requested leased follow-up.",
+    },
+  );
+
+  const response = await queue.fetch(command.clone());
+  assert.equal(response.status, 202);
+  assert.equal((await response.json()).queued, true);
+  const afterCommand = structuredClone(await storage.get("exact-review-queue")) as {
+    items: Record<
+      string,
+      {
+        state: string;
+        revision: number;
+        leaseId?: string;
+        leaseRevision?: number;
+        decision: Record<string, unknown>;
+        leaseDecision?: Record<string, unknown>;
+      }
+    >;
+  };
+  const active = afterCommand.items["openclaw/openclaw#760"];
+  assert.equal(active.state, "leased");
+  assert.equal(active.revision, 2);
+  assert.equal(active.leaseId, "lease-760");
+  assert.equal(active.leaseRevision, 1);
+  assert.equal(active.leaseDecision?.commandStatusMarker, undefined);
+  assert.equal(active.leaseDecision?.sourceHeadSha, currentHeadSha);
+  assert.equal(active.decision.sourceHeadSha, currentHeadSha);
+  assert.equal(active.decision.sourceAuthoritySeq, 3);
+  assert.equal(active.decision.commandStatusMarker, commandStatusMarker);
+  assert.equal(active.decision.statusCommentId, 9003);
+  assert.equal(active.decision.additionalPrompt, "Inspect the command-requested leased follow-up.");
+
+  const redelivery = await queue.fetch(command);
+  assert.equal(redelivery.status, 202);
+  assert.equal((await redelivery.json()).deduped, true);
+  assert.deepEqual(await storage.get("exact-review-queue"), afterCommand);
+
+  const completion = await queue.fetch(
+    new Request("https://clawsweeper-exact-review-queue/complete", {
+      method: "POST",
+      body: JSON.stringify({
+        lease_id: "lease-760",
+        item_key: "openclaw/openclaw#760",
+        lease_revision: 1,
+        claim_generation: 1,
+        run_id: "7600",
+        run_attempt: 1,
+        outcome: "success",
+      }),
+    }),
+  );
+  assert.equal(completion.status, 200);
+  assert.deepEqual(await completion.json(), { ok: true, requeued: true });
+  const completed = (await storage.get("exact-review-queue")) as typeof afterCommand;
+  const followUp = completed.items["openclaw/openclaw#760"];
+  assert.equal(followUp.state, "pending");
+  assert.equal(followUp.revision, 2);
+  assert.equal(followUp.leaseId, undefined);
+  assert.equal(followUp.leaseDecision, undefined);
+  assert.equal(followUp.decision.sourceHeadSha, currentHeadSha);
+  assert.equal(followUp.decision.sourceAuthoritySeq, 3);
+  assert.equal(followUp.decision.commandStatusMarker, commandStatusMarker);
+  assert.equal(followUp.decision.statusCommentId, 9003);
+  assert.equal(
+    followUp.decision.additionalPrompt,
+    "Inspect the command-requested leased follow-up.",
+  );
+});
+
 test("same-timestamp verified successor replaces the current pull request head", async () => {
   const storage = new MemoryDurableStorage();
   const currentHeadSha = "b".repeat(40);
