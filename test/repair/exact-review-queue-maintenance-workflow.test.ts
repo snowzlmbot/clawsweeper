@@ -12,7 +12,6 @@ const workflow = YAML.parse(source) as {
   jobs: Record<
     string,
     {
-      if: string;
       env: Record<string, string>;
       steps: Array<{ name?: string; env?: Record<string, string>; run?: string }>;
     }
@@ -21,18 +20,17 @@ const workflow = YAML.parse(source) as {
 
 test("queue maintenance is explicit, bounded, and non-cancelling", () => {
   assert.equal(workflow.on.schedule, undefined);
-  assert.deepEqual(Object.keys(workflow.on.workflow_dispatch.inputs), ["execute", "passes"]);
+  assert.deepEqual(Object.keys(workflow.on.workflow_dispatch.inputs), ["execute"]);
   assert.equal(workflow.concurrency["cancel-in-progress"], false);
   assert.deepEqual(workflow.permissions, { contents: "read" });
-  assert.match(workflow.jobs.reconcile!.if, /inputs\.execute/);
   const maintenance = workflow.jobs.reconcile!.steps.find(
-    (step) => step.name === "Reconcile superseded publication items",
+    (step) => step.name === "Preview or reconcile historical publication lineages",
   );
-  assert.equal(maintenance?.env?.PASSES, "${{ inputs.passes }}");
+  assert.equal(maintenance?.env?.EXECUTE, "${{ inputs.execute }}");
   const run = maintenance?.run || "";
   assert.match(run, /repair:exact-review-queue-maintenance/);
   assert.match(run, /--max-items 100/);
-  assert.match(run, /--passes "\$PASSES"/);
-  assert.doesNotMatch(run, /inputs\.passes/);
+  assert.match(run, /args\+=\(--apply\)/);
+  assert.doesNotMatch(run, /--passes/);
   assert.doesNotMatch(source, /schedule:/);
 });
