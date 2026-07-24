@@ -3077,11 +3077,16 @@ export class ExactReviewQueue {
             left.item.createdAt - right.item.createdAt ||
             left.item.key.localeCompare(right.item.key),
         );
-      protectedLineageItems += active.length;
-      const retained = active[0] ?? pending[0];
+      if (active.length) {
+        // An active owner may still publish its captured decision. Preserve the
+        // whole lineage until ownership expires so newer provenance is not lost.
+        protectedLineageItems += entries.length;
+        continue;
+      }
+      const retained = pending[0];
       if (!retained) continue;
 
-      if (!active.length && pending.length > 1) {
+      if (pending.length > 1) {
         const freshest = pending.reduce((latest, candidate) => {
           const latestPublication = latest.item.decision.publication;
           const candidatePublication = candidate.item.decision.publication;

@@ -969,9 +969,9 @@ test("publication reconcile backfills historical duplicate lineages in bounded p
   }
 });
 
-test("publication lineage reconcile preserves active batch ownership", async () => {
+test("publication lineage reconcile defers the whole lineage while a batch owns it", async () => {
   const originalNow = Date.now;
-  const now = 6_475_000;
+  let now = 6_475_000;
   Date.now = () => now;
   try {
     const storage = new TestStorage();
@@ -1028,10 +1028,11 @@ test("publication lineage reconcile preserves active batch ownership", async () 
     const applied = await (
       await queue.fetch(batchRequest("/publications/reconcile", { apply: true, max_items: 100 }))
     ).json();
-    assert.equal(applied.changed, 1);
-    assert.equal(applied.lineage_duplicate_changed, 1);
+    assert.equal(applied.changed, 0);
+    assert.equal(applied.eligible, 0);
+    assert.equal(applied.lineage_duplicate_changed, 0);
     assert.equal(applied.protected_batch_items, 1);
-    assert.equal(applied.protected_lineage_items, 1);
+    assert.equal(applied.protected_lineage_items, 2);
 
     const fetched = await (
       await queue.fetch(
@@ -1043,6 +1044,21 @@ test("publication lineage reconcile preserves active batch ownership", async () 
     ).json();
     assert.equal(fetched.batch.items[0].item_key, keys[0]);
     assert.equal(fetched.items[0].item_key, keys[0]);
+
+    now += 60_001;
+    const reconciled = await (
+      await queue.fetch(batchRequest("/publications/reconcile", { apply: true, max_items: 100 }))
+    ).json();
+    assert.equal(reconciled.changed, 1);
+    assert.equal(reconciled.lineage_duplicate_changed, 1);
+    assert.equal(reconciled.lineage_refreshed, 1);
+
+    const publications = await (
+      await queue.fetch(batchRequest("/publications/list", { limit: 100 }))
+    ).json();
+    assert.equal(publications.publications.length, 1);
+    assert.equal(publications.publications[0].item_key, keys[0]);
+    assert.equal(publications.publications[0].decision.publication.producerRunId, "2502");
   } finally {
     Date.now = originalNow;
   }
