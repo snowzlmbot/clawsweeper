@@ -3493,7 +3493,7 @@ export class ExactReviewQueue {
     const now = Date.now();
     let batch = this.batchStore.fetch(batchId, leaseOwner, now);
     if (!batch) return json({ error: "batch_lease_not_active" }, 409);
-    const state = this.readStateSync();
+    let state = this.readStateSync();
     const stale: PublicationBatchCompletion[] = batch.items
       .filter((membership) => {
         if (membership.terminalOutcome !== null) return false;
@@ -3515,8 +3515,42 @@ export class ExactReviewQueue {
         terminalOutcome: "superseded",
       }));
     if (stale.length) {
-      batch = this.batchStore.complete(batchId, leaseOwner, stale, now);
+      batch = this.batchStore.complete(batchId, leaseOwner, stale, now, {}, (accepted) => {
+        const current = this.readStateSync();
+        let superseded = 0;
+        for (const completion of accepted) {
+          const item = current.items[completion.itemKey];
+          const publicationRevision = item ? exactReviewPublicationRevision(item.decision) : null;
+          if (
+            !item ||
+            item.revision !== completion.revision ||
+            !exactReviewQueueIsPublication(item) ||
+            !publicationRevision ||
+            publicationRevision.sourceRevision >=
+              this.publicationHeadRevisionSync(publicationRevision.targetKey)
+          ) {
+            continue;
+          }
+          const result = finishExactReviewPublicationQueueItem({
+            state: current,
+            item,
+            now,
+            completion: { kind: "superseded", reasonCode: "remote_newer_tuple" },
+            ownedRevision: completion.revision,
+            deadLetterCapacityAvailable: true,
+            env: this.env,
+          });
+          if (!result.requeued && !result.parked) superseded += 1;
+        }
+        if (!superseded) return;
+        this.writeStateSync(current);
+        this.incrementQueueMetricsSync({
+          publicationCompleted: superseded,
+          publicationSuperseded: superseded,
+        });
+      });
       if (!batch) return json({ error: "batch_lease_not_active" }, 409);
+      state = this.readStateSync();
       await this.scheduleNext(state, now);
     }
     const items = batch.items.flatMap((membership) => {
