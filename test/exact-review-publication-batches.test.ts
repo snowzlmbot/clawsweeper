@@ -1938,7 +1938,9 @@ test("fresh publication admission reserves bounded service and preserves histori
     }
     now += 60_001;
     for (let itemNumber = 90; itemNumber <= 92; itemNumber += 1) {
-      await queue.fetch(publicationRequest(`fresh-${itemNumber}`, itemNumber, String(7100 + itemNumber)));
+      await queue.fetch(
+        publicationRequest(`fresh-${itemNumber}`, itemNumber, String(7100 + itemNumber)),
+      );
       now += 1;
     }
 
@@ -1961,12 +1963,15 @@ test("fresh publication admission reserves bounded service and preserves histori
       )
     ).json();
     const keys = new Set(claim.batch.items.map((item: { item_key: string }) => item.item_key));
-    assert.deepEqual(keys, new Set([
-      "openclaw/openclaw#10@publish:7010:1",
-      "openclaw/openclaw#11@publish:7011:1",
-      "openclaw/openclaw#12@publish:7012:1",
-      "openclaw/openclaw#90@publish:7190:1",
-    ]));
+    assert.deepEqual(
+      keys,
+      new Set([
+        "openclaw/openclaw#10@publish:7010:1",
+        "openclaw/openclaw#11@publish:7011:1",
+        "openclaw/openclaw#12@publish:7012:1",
+        "openclaw/openclaw#90@publish:7190:1",
+      ]),
+    );
   } finally {
     Date.now = originalNow;
   }

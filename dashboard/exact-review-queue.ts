@@ -3498,9 +3498,7 @@ export class ExactReviewQueue {
       .filter((membership) => {
         if (membership.terminalOutcome !== null) return false;
         const item = state.items[membership.itemKey];
-        const publicationRevision = item
-          ? exactReviewPublicationRevision(item.decision)
-          : null;
+        const publicationRevision = item ? exactReviewPublicationRevision(item.decision) : null;
         return (
           !item ||
           item.revision !== membership.revision ||
@@ -7990,8 +7988,7 @@ function exactReviewPublicationBatchDeparture(
     .find((item) => freshItemKeys.has(item.key))
     ?.decision.targetRepo.split("/", 1)[0]
     ?.toLowerCase();
-  const owner =
-    freshOwner ?? candidates[0]?.decision.targetRepo.split("/", 1)[0]?.toLowerCase();
+  const owner = freshOwner ?? candidates[0]?.decision.targetRepo.split("/", 1)[0]?.toLowerCase();
   if (!owner) {
     return Number.isFinite(nextEligibilityAt)
       ? { candidateCount: 0, maxItems, dueAt: nextEligibilityAt, due: false }
@@ -8008,7 +8005,9 @@ function exactReviewPublicationBatchDeparture(
   // Keep a fresh owner's bounded service even when another owner could fill a
   // historical batch. Without fresh work, retain the existing full-owner choice.
   const selectedOwner =
-    freshOwner ?? [...candidatesByOwner].find(([, group]) => group.length >= maxItems)?.[0] ?? owner;
+    freshOwner ??
+    [...candidatesByOwner].find(([, group]) => group.length >= maxItems)?.[0] ??
+    owner;
   const ownerCandidates = candidatesByOwner.get(selectedOwner)!;
   const oldestAt = ownerCandidates[0]!.createdAt;
   const fullAt = ownerCandidates.length >= maxItems ? now : Number.POSITIVE_INFINITY;
