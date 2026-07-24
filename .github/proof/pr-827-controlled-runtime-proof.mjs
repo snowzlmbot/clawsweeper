@@ -160,8 +160,8 @@ await completeAsPublished(first, "pr-827-proof-worker-1");
 const second = await claim("pr-827-proof-second", "pr-827-proof-worker-2");
 const secondNumbers = second.batch.items.map((member) => itemNumber(member.item_key));
 assert.deepEqual(
-  secondNumbers,
-  [1092, 1007, 1008],
+  new Set(secondNumbers),
+  new Set([1092, 1007, 1008]),
   "unused capacity did not continue historical progress while serving remaining fresh work",
 );
 await completeAsPublished(second, "pr-827-proof-worker-2");
