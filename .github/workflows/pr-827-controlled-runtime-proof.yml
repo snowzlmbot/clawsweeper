@@ -1,0 +1,90 @@
+name: PR 827 controlled runtime proof
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - evidence/issue-826-pr-827-runtime
+
+permissions:
+  contents: read
+
+jobs:
+  controlled-runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      SUBJECT_SHA: 20b7f32282a81aedc3a478be3b92ae6bc816fa7e
+      PROOF_SECRET: pr-827-controlled-runtime-only
+    steps:
+      - name: Check out evidence harness
+        uses: actions/checkout@v7
+
+      - name: Check out exact PR head
+        uses: actions/checkout@v7
+        with:
+          repository: snowzlmbot/clawsweeper
+          ref: ${{ env.SUBJECT_SHA }}
+          path: subject
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 26
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.10.0 --activate
+
+      - name: Verify and install exact subject
+        working-directory: subject
+        run: |
+          test "$(git rev-parse HEAD)" = "$SUBJECT_SHA"
+          pnpm install --frozen-lockfile
+
+      - name: Start isolated Worker runtime
+        working-directory: subject
+        run: |
+          mkdir -p .artifacts/pr-827-controlled-runtime-proof
+          nohup pnpm dlx wrangler@4.107.0 dev \
+            --config dashboard/wrangler.toml \
+            --local \
+            --ip 127.0.0.1 \
+            --port 8787 \
+            --persist-to .artifacts/pr-827-controlled-runtime-proof/state \
+            --var CLAWSWEEPER_WEBHOOK_SECRET:"$PROOF_SECRET" \
+            --var EXACT_REVIEW_PUBLICATION_BATCHING_ENABLED:1 \
+            --var EXACT_REVIEW_PUBLICATION_BATCH_SIZE:8 \
+            --var EXACT_REVIEW_PUBLICATION_BATCH_MAX_CONCURRENT:8 \
+            --var EXACT_REVIEW_PUBLICATION_FRESH_LANE_ENABLED:1 \
+            --var EXACT_REVIEW_PUBLICATION_FRESH_LANE_MAX_ITEMS:2 \
+            --var EXACT_REVIEW_PUBLICATION_FRESH_LANE_MAX_AGE_MS:60000 \
+            --var EXACT_REVIEW_PUBLICATION_BATCH_WAIT_MS:1000 \
+            > .artifacts/pr-827-controlled-runtime-proof/worker.log 2>&1 &
+          echo $! > .artifacts/pr-827-controlled-runtime-proof/worker.pid
+          for attempt in $(seq 1 90); do
+            if curl --fail --silent http://127.0.0.1:8787/api/health >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          tail -100 .artifacts/pr-827-controlled-runtime-proof/worker.log
+          exit 1
+
+      - name: Exercise bounded freshness and source-drift fencing
+        env:
+          PROOF_BASE_URL: http://127.0.0.1:8787
+          PROOF_WEBHOOK_SECRET: ${{ env.PROOF_SECRET }}
+          PROOF_SUBJECT_SHA: ${{ env.SUBJECT_SHA }}
+          PROOF_OUTPUT: subject/.artifacts/pr-827-controlled-runtime-proof/report.json
+        run: node .github/proof/pr-827-controlled-runtime-proof.mjs
+
+      - name: Upload controlled runtime report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr-827-controlled-runtime-proof
+          path: subject/.artifacts/pr-827-controlled-runtime-proof/report.json
+          if-no-files-found: error
