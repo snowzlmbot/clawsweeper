@@ -949,7 +949,17 @@ test("publication reconcile backfills historical duplicate lineages in bounded p
       (item: { item_key: string }) => item.item_key === keys[0],
     );
     assert.equal(retained.attempts, 7);
+    assert.equal(retained.revision, 2);
     assert.equal(retained.decision.publication.producerRunId, "2403");
+
+    const staleSupersede = await (
+      await queue.fetch(
+        batchRequest("/publications/supersede", {
+          items: [{ item_key: keys[0], revision: 1 }],
+        }),
+      )
+    ).json();
+    assert.equal(staleSupersede.superseded, 0);
 
     const secondPass = await (
       await queue.fetch(batchRequest("/publications/reconcile", { apply: true, max_items: 100 }))

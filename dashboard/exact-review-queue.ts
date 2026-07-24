@@ -3193,6 +3193,7 @@ export class ExactReviewQueue {
             continue;
           }
           retained.decision = refresh.decision;
+          retained.revision += 1;
           retained.updatedAt = now;
           lineageRefreshed += 1;
         }
